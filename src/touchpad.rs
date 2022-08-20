@@ -21,6 +21,7 @@ impl TouchpadHandler {
 
 impl InputHandler for TouchpadHandler {
     fn apply_changes(&mut self, key: &str) -> Result<(), Box<dyn Error>> {
+        println!("Applying");
         match key {
             "speed" => {
                 let new_val: f64 = self.settings.get(key);
