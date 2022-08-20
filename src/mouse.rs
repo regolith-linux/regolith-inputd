@@ -4,7 +4,7 @@ pub struct MouseHandler {
     settings: Settings,
 }
 impl MouseHandler {
-    pub async fn new() -> MouseHandler {
+    pub fn new() -> MouseHandler {
         let settings = Settings::new("org.gnome.desktop.peripherals.mouse");
         MouseHandler { settings }
     }

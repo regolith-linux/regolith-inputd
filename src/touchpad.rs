@@ -1,8 +1,7 @@
 use crate::InputHandler;
-use async_trait::async_trait;
 use gio::{prelude::SettingsExtManual, Settings};
-use swayipc_async::Connection as SwayConnection;
-use tokio::task::spawn_blocking;
+use std::error::Error;
+use swayipc::Connection as SwayConnection;
 
 pub struct TouchpadHandler {
     settings: Settings,
@@ -10,9 +9,9 @@ pub struct TouchpadHandler {
 }
 
 impl TouchpadHandler {
-    pub async fn new() -> TouchpadHandler {
+    pub fn new() -> TouchpadHandler {
         let settings = Settings::new("org.gnome.desktop.peripherals.touchpad");
-        let connection = SwayConnection::new().await.unwrap();
+        let connection = SwayConnection::new().unwrap();
         TouchpadHandler {
             settings,
             sway_connection: connection,
@@ -21,15 +20,16 @@ impl TouchpadHandler {
 }
 
 impl InputHandler for TouchpadHandler {
-    fn apply_changes(&mut self, key: &str) {
+    fn apply_changes(&mut self, key: &str) -> Result<(), Box<dyn Error>> {
         match key {
             "speed" => {
                 let new_val: f64 = self.settings.get(key);
                 let cmd = format!("input type:touchpad pointer_accel {new_val}");
-                self.sway_connection.run_command(cmd);
+                self.sway_connection.run_command(cmd)?;
             }
             _ => (),
         };
+        Ok(())
     }
     fn settings(&self) -> &Settings {
         &self.settings

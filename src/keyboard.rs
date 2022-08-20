@@ -5,7 +5,7 @@ pub struct KeyboardHandler {
     settings: Settings,
 }
 impl KeyboardHandler {
-    pub async fn new() -> KeyboardHandler {
+    pub fn new() -> KeyboardHandler {
         let settings = Settings::new("org.gnome.desktop.peripherals.keyboard");
         KeyboardHandler { settings }
     }
