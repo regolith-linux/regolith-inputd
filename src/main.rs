@@ -2,6 +2,7 @@ use gio::{prelude::ApplicationExtManual, traits::ApplicationExt, Application, Ap
 use regolith_inputd::SettingsManager;
 
 fn main() {
+    pretty_env_logger::init();
     let app = Application::new(Some("org.regolith.inputd"), ApplicationFlags::IS_SERVICE);
     let mut manager = SettingsManager::new();
     manager.start_monitoring();
