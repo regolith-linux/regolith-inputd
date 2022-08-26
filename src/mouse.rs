@@ -26,7 +26,7 @@ impl InputHandler for MouseHandler {
         match key {
             "speed" => self.apply_speed()?,
             "natural-scroll" => self.apply_natural_scroll()?,
-            "left-handed" => self.left_handed()?,
+            "left-handed" => self.apply_left_handed()?,
             _ => (),
         };
         Ok(())

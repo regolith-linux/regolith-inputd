@@ -18,22 +18,6 @@ impl TouchpadHandler {
             sway_connection: connection,
         }
     }
-    // fn apply_speed(&mut self, key: &str) -> Result<(), Box<dyn Error>> {
-    //     let new_val: f64 = self.settings.get(key);
-    //     let cmd = format!("input type:touchpad pointer_accel {new_val}");
-    //     self.sway_connection.run_command(cmd)?;
-    //     Ok(())
-    // }
-    // fn apply_natural_scroll(&mut self, key: &str) -> Result<(), Box<dyn Error>> {
-    //     let new_val: &str = if self.settings.get(key) {
-    //         "enabled"
-    //     } else {
-    //         "disabled"
-    //     };
-    //     let cmd = format!("input type:touchpad natural_scroll {new_val}");
-    //     self.sway_connection.run_command(cmd)?;
-    //     Ok(())
-    // }
     fn apply_tap(&mut self) -> Result<(), Box<dyn Error>> {
         let new_val: &str = if self.settings.get("tap-to-click") {
             "enabled"
@@ -58,6 +42,56 @@ impl TouchpadHandler {
         self.sway_connection.run_command(cmd)?;
         Ok(())
     }
+    fn use_dwt(&mut self) -> Result<(), Box<dyn Error>> {
+        let new_val: &str = if self.settings.get("disable-while-typing") {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        let cmd = format!("input type:touchpad dwt {new_val}");
+        self.sway_connection.run_command(cmd)?;
+        Ok(())
+    }
+    fn send_events(&mut self) -> Result<(), Box<dyn Error>> {
+        let new_val: String = self.settings().get("send-events");
+        let cmd = format!("input type:touchpad events {new_val}");
+        debug!("{cmd}");
+        self.sway_connection.run_command(cmd)?;
+        Ok(())
+    }
+    fn use_drag(&mut self) -> Result<(), Box<dyn Error>> {
+        let new_val: &str = if self.settings.get("tap-and-drag") {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        let cmd = format!("input type:touchpad drag {new_val}");
+        debug!("{cmd}");
+        self.sway_connection.run_command(cmd)?;
+        Ok(())
+    }
+    fn use_drag_lock(&mut self) -> Result<(), Box<dyn Error>> {
+        let new_val: &str = if self.settings.get("tap-and-drag-lock") {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        let cmd = format!("input type:touchpad drag_lock {new_val}");
+        debug!("{cmd}");
+        self.sway_connection.run_command(cmd)?;
+        Ok(())
+    }
+
+    fn emulate_middle_click(&mut self) -> Result<(), Box<dyn Error>> {
+        let new_val: &str = if self.settings.get("middle-click-emulation") {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        let cmd = format!("input type:touchpad middle_emulation {new_val}");
+        self.sway_connection.run_command(cmd)?;
+        Ok(())
+    }
 }
 
 impl PointerMethods for TouchpadHandler {
@@ -76,7 +110,12 @@ impl InputHandler for TouchpadHandler {
             "two-finger-scrolling-enabled" | "edge-scrolling-enabled" => {
                 self.apply_scroll_method()?
             }
-            "left-handed" => self.left_handed()?,
+            "left-handed" => self.apply_left_handed()?,
+            "send-events" => self.send_events()?,
+            "disable-while-typing" => self.use_dwt()?,
+            "tap-and-drag" => self.use_drag()?,
+            "tap-and-drag-lock" => self.use_drag_lock()?,
+            "middle-click-emulation" => self.emulate_middle_click()?,
             _ => (),
         };
         Ok(())

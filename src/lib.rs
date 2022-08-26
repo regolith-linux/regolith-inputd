@@ -55,7 +55,7 @@ pub trait PointerMethods: InputHandler {
         self.sway_connection().run_command(cmd)?;
         Ok(())
     }
-    fn left_handed(&mut self) -> Result<(), Box<dyn Error>> {
+    fn apply_left_handed(&mut self) -> Result<(), Box<dyn Error>> {
         let new_val: &str = if self.settings().get("left-handed") {
             "disabled"
         } else {
