@@ -1,19 +1,27 @@
 use crate::InputHandler;
 use gio::{prelude::SettingsExtManual, Settings};
-use std::error::Error;
-use swayipc::Connection as SwayConnection;
+use std::{
+    error::Error,
+    sync::mpsc::{self, Receiver, Sender},
+};
+use swayipc::{Connection as SwayConnection, Input};
 
 pub struct KeyboardHandler {
     settings: Settings,
     sway_connection: SwayConnection,
+    tx: Sender<Input>,
+    rx: Receiver<Input>,
 }
 impl KeyboardHandler {
     pub fn new() -> KeyboardHandler {
         let settings = Settings::new("org.gnome.desktop.peripherals.keyboard");
         let sway_connection = SwayConnection::new().unwrap();
+        let (tx, rx) = mpsc::channel();
         KeyboardHandler {
             settings,
             sway_connection,
+            tx,
+            rx,
         }
     }
     fn set_repeat_interval(&mut self) -> Result<(), Box<dyn Error>> {
@@ -46,5 +54,15 @@ impl InputHandler for KeyboardHandler {
     fn sway_connection(&mut self) -> &mut swayipc::Connection {
         &mut self.sway_connection
     }
+    fn get_swayinput_tx(&self) -> Sender<Input> {
+        self.tx.clone()
+    }
+    fn get_swayinput_rx(&self) -> &Receiver<Input> {
+        &self.rx
+    }
+    fn apply_all(&mut self) -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
     fn monitor_sway_inputs(&self) {}
 }
+unsafe impl Send for KeyboardHandler {}

@@ -1,92 +1,97 @@
 mod keyboard;
 mod mouse;
 mod touchpad;
+mod traits;
 
-use gio::prelude::SettingsExtManual;
-use gio::{traits::SettingsExt, Settings};
 use keyboard::KeyboardHandler;
-use log::{debug, error};
+use log::{debug, warn};
 use mouse::MouseHandler;
 use std::error::Error;
-use swayipc::Connection as SwayConnection;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+use swayipc::{Connection as SwayConnection, Event, EventStream, EventType, Fallible, Input};
 use touchpad::TouchpadHandler;
+use traits::InputHandler;
 
-pub trait InputHandler {
-    fn settings(&self) -> &Settings;
-    fn sway_connection(&mut self) -> &mut SwayConnection;
-    fn monitor_sway_inputs(&self);
-    fn apply_changes(&mut self, _: &str) -> Result<(), Box<dyn Error>> {
-        Ok(())
-    }
-    fn monitor_gsettings_change(&mut self)
-    where
-        Self: 'static,
-    {
-        let ptr: *mut Self = self;
-        self.settings().connect_changed(None, move |_, key| unsafe {
-            if !ptr.is_null() {
-                if let Err(e) = (*ptr).apply_changes(key) {
-                    error!("{e}");
-                };
-            }
-        });
-    }
-}
+// Type Aliases
+type SharedRef<T> = Arc<Mutex<T>>;
+type HandlerList = SharedRef<[Box<dyn InputHandler + Send>; 3]>;
 
-pub trait PointerMethods: InputHandler {
-    fn pointer_type(&self) -> &str {
-        "pointer"
-    }
-    fn apply_speed(&mut self) -> Result<(), Box<dyn Error>> {
-        let new_val: f64 = self.settings().get("speed");
-        let pointer_type = self.pointer_type();
-        let cmd = format!("input type:{pointer_type} pointer_accel {new_val}");
-        self.sway_connection().run_command(cmd)?;
-        Ok(())
-    }
-    fn apply_natural_scroll(&mut self) -> Result<(), Box<dyn Error>> {
-        let new_val: &str = if self.settings().get("natural-scroll") {
-            "enabled"
-        } else {
-            "disabled"
-        };
-        let pointer_type = self.pointer_type();
-        let cmd = format!("input type:{pointer_type} natural_scroll {new_val}");
-        self.sway_connection().run_command(cmd)?;
-        Ok(())
-    }
-    fn apply_left_handed(&mut self) -> Result<(), Box<dyn Error>> {
-        let new_val: &str = if self.settings().get("left-handed") {
-            "disabled"
-        } else {
-            "enabled"
-        };
-        let pointer_type = self.pointer_type();
-        let cmd = format!("input type:{pointer_type} left_handed {new_val}");
-        debug!("{cmd}");
-        self.sway_connection().run_command(cmd)?;
-        Ok(())
-    }
-}
-
+// Structs
 pub struct SettingsManager {
-    handlers: [Box<dyn InputHandler>; 3],
+    handlers: HandlerList,
 }
 
+// Method Implementations
 impl SettingsManager {
     pub fn new() -> SettingsManager {
-        let handlers: [Box<dyn InputHandler>; 3] = [
+        let handlers: HandlerList = Arc::new(Mutex::new([
             Box::new(MouseHandler::new()),
             Box::new(KeyboardHandler::new()),
             Box::new(TouchpadHandler::new()),
-        ];
+        ]));
         SettingsManager { handlers }
     }
 
-    pub fn start_monitoring(&mut self) {
-        for handle in &mut self.handlers {
+    pub fn start_monitoring(&mut self) -> Result<(), Box<dyn Error + '_>> {
+        let mut handlers_lock = self.handlers.lock()?;
+        for handle in handlers_lock.iter_mut() {
+            handle.apply_all()?;
             handle.monitor_gsettings_change();
-            handle.monitor_sway_inputs();
         }
+
+        let mut handlers_sref = self.handlers.clone();
+        thread::spawn(move || {
+            let mut retry_count = 0;
+            let event_stream = loop {
+                match get_new_inputevent_stream() {
+                    Ok(stream) => break stream,
+                    Err(e) => {
+                        // Report Error and retry connection
+                        warn!("Failed to subscribe to sway input event: {e}. Retrying...");
+                        if retry_count < 5 {
+                            thread::sleep(Duration::from_secs(retry_count));
+                            retry_count += 1;
+                        } else {
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            };
+            for event in event_stream {
+                match event {
+                    Ok(Event::Input(event)) => {
+                        sync_input_gsettings(&mut handlers_sref, event.input).unwrap()
+                    }
+                    Err(e) => warn!("{e}"),
+                    _ => continue,
+                }
+            }
+        });
+        Ok(())
     }
+}
+
+// Functions
+fn sync_input_gsettings(
+    handlers_sref: &mut HandlerList,
+    input: Input,
+) -> Result<(), Box<dyn Error + '_>> {
+    let input_type = input.input_type.clone();
+    let handler_index = match input_type.as_ref() {
+        "pointer" => 0,
+        "keyboard" => 1,
+        "touchpad" => 2,
+        _ => return Err("Incompatible input type".into()),
+    };
+    debug!("Recieved event for {handler_index}");
+    let mut handlers_lock = handlers_sref.lock()?;
+    handlers_lock[handler_index].sync_gsettings(input)?;
+    Ok(())
+}
+fn get_new_inputevent_stream() -> Fallible<EventStream> {
+    let connection = SwayConnection::new()?;
+    let subs = [EventType::Input];
+    connection.subscribe(subs)
 }
