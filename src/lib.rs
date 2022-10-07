@@ -4,7 +4,7 @@ mod touchpad;
 mod traits;
 
 use keyboard::KeyboardHandler;
-use log::{debug, warn};
+use log::{info, warn};
 use mouse::MouseHandler;
 use std::error::Error;
 use std::sync::{Arc, Mutex};
@@ -85,7 +85,7 @@ fn sync_input_gsettings(
         "touchpad" => 2,
         _ => return Err("Incompatible input type".into()),
     };
-    debug!("Recieved event for {handler_index}");
+    info!("Recieved Sway InputEvent for {}", input.input_type);
     let mut handlers_lock = handlers_sref.lock()?;
     handlers_lock[handler_index].sync_gsettings(input)?;
     Ok(())

@@ -1,18 +1,18 @@
 use gio::prelude::SettingsExtManual;
 use gio::{traits::SettingsExt, Settings};
-use log::{debug, error};
+use log::error;
 use std::error::Error;
-use std::sync::mpsc::{Receiver, Sender};
 use swayipc::{Connection as SwayConnection, EnabledOrDisabled, Input, SendEvents};
 pub trait InputHandler {
     fn settings(&self) -> &Settings;
     fn sway_connection(&mut self) -> &mut SwayConnection;
-    fn monitor_sway_inputs(&self) {}
-    fn apply_changes(&mut self, _: &str) -> Result<(), Box<dyn Error>> {
+    fn apply_changes(&mut self, _: &str) -> Result<(), Box<dyn Error>>;
+    fn apply_all(&mut self) -> Result<(), Box<dyn Error>> {
         Ok(())
     }
-    fn get_swayinput_tx(&self) -> Sender<Input>;
-    fn get_swayinput_rx(&self) -> &Receiver<Input>;
+    fn sync_gsettings(&mut self, _: Input) -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
     fn monitor_gsettings_change(&mut self)
     where
         Self: 'static,
@@ -26,16 +26,11 @@ pub trait InputHandler {
             }
         });
     }
-    fn sync_gsettings(&mut self, _: Input) -> Result<(), Box<dyn Error>> {
-        Ok(())
-    }
-    fn apply_all(&mut self) -> Result<(), Box<dyn Error>>;
 }
 
 pub trait PointerMethods: InputHandler {
-    fn pointer_type(&self) -> &str {
-        "pointer"
-    }
+    fn pointer_type(&self) -> &str;
+    fn apply_left_handed(&mut self) -> Result<(), Box<dyn Error>>;
     fn apply_speed(&mut self) -> Result<(), Box<dyn Error>> {
         let new_val: f64 = self.settings().get("speed");
         let pointer_type = self.pointer_type();
@@ -54,27 +49,11 @@ pub trait PointerMethods: InputHandler {
         self.sway_connection().run_command(cmd)?;
         Ok(())
     }
-    fn apply_left_handed(&mut self) -> Result<(), Box<dyn Error>> {
-        let new_val: &str = self
-            .settings()
-            .get::<bool>("left-handed")
-            .to_sway_type()
-            .to_primitive();
-        let pointer_type = self.pointer_type();
-        let cmd = format!("input type:{pointer_type} left_handed {new_val}");
-        debug!("{cmd}");
-        self.sway_connection().run_command(cmd)?;
-        Ok(())
-    }
     fn sync_pointer_gsettings(&self, input: &Input) -> Result<(), Box<dyn Error>> {
         if input.libinput.is_none() {
             return Ok(());
         }
         let libinput = input.libinput.as_ref().unwrap();
-        if let Some(enabled) = libinput.send_events.as_ref() {
-            self.settings()
-                .set_string("send-events", enabled.to_primitive())?;
-        }
         if let Some(speed) = libinput.accel_speed {
             self.settings().set_double("speed", speed)?;
         }
@@ -82,6 +61,11 @@ pub trait PointerMethods: InputHandler {
             self.settings()
                 .set_boolean("natural-scroll", natural.to_primitive())?;
         }
+        if let Some(left_handed) = libinput.left_handed.as_ref() {
+            self.settings()
+                .set_boolean("left-handed", left_handed.to_primitive())?;
+        }
+
         Ok(())
     }
 }

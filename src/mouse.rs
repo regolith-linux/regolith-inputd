@@ -1,36 +1,45 @@
-use crate::traits::{InputHandler, PointerMethods};
-use gio::Settings;
-use log::debug;
-use std::{
-    error::Error,
-    sync::mpsc::{self, Receiver, Sender},
-};
+use crate::traits::{InputHandler, PointerMethods, PrimitiveToSwayType, SwayTypeToPrimitive};
+use gio::{prelude::SettingsExtManual, Settings};
+use log::info;
+use std::error::Error;
 use swayipc::{Connection as SwayConnection, Input};
 pub struct MouseHandler {
     settings: Settings,
     sway_connection: SwayConnection,
-    tx: Sender<Input>,
-    rx: Receiver<Input>,
 }
+
 impl MouseHandler {
     pub fn new() -> MouseHandler {
         let settings = Settings::new("org.gnome.desktop.peripherals.mouse");
         let sway_connection = SwayConnection::new().unwrap();
-        let (tx, rx) = mpsc::channel();
         MouseHandler {
             settings,
             sway_connection,
-            tx,
-            rx,
         }
     }
 }
 
-impl PointerMethods for MouseHandler {}
+impl PointerMethods for MouseHandler {
+    fn pointer_type(&self) -> &str {
+        "pointer"
+    }
+    fn apply_left_handed(&mut self) -> Result<(), Box<dyn Error>> {
+        let new_val: &str = self
+            .settings()
+            .get::<bool>("left-handed")
+            .to_sway_type()
+            .to_primitive();
+        let pointer_type = self.pointer_type();
+        let cmd = format!("input type:{pointer_type} left_handed {new_val}");
+        info!("Executing command: {cmd}");
+        self.sway_connection().run_command(cmd)?;
+        Ok(())
+    }
+}
 
 impl InputHandler for MouseHandler {
     fn apply_changes(&mut self, key: &str) -> Result<(), Box<dyn Error>> {
-        debug!("{key}");
+        info!("org.gnome.desktop.peripherals.mouse -> Key: {key} chaged");
         match key {
             "speed" => self.apply_speed()?,
             "natural-scroll" => self.apply_natural_scroll()?,
@@ -42,12 +51,6 @@ impl InputHandler for MouseHandler {
     fn settings(&self) -> &Settings {
         &self.settings
     }
-    fn get_swayinput_tx(&self) -> Sender<Input> {
-        self.tx.clone()
-    }
-    fn get_swayinput_rx(&self) -> &Receiver<Input> {
-        &self.rx
-    }
     fn sway_connection(&mut self) -> &mut swayipc::Connection {
         &mut self.sway_connection
     }
@@ -57,11 +60,9 @@ impl InputHandler for MouseHandler {
         self.apply_natural_scroll()?;
         Ok(())
     }
-    fn sync_gsettings(&mut self, _input: Input) -> Result<(), Box<dyn Error>> {
-        let rx_ref = self.get_swayinput_rx();
-        for input in rx_ref {
-            self.sync_pointer_gsettings(&input)?;
-        }
+    fn sync_gsettings(&mut self, input: Input) -> Result<(), Box<dyn Error>> {
+        info!("Syncronizing mouse input state of sway with gsettings...");
+        self.sync_pointer_gsettings(&input)?;
         Ok(())
     }
 }

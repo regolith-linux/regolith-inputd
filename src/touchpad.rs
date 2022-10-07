@@ -1,31 +1,22 @@
 use crate::traits::{InputHandler, PointerMethods, PrimitiveToSwayType, SwayTypeToPrimitive};
 use gio::{prelude::SettingsExtManual, traits::SettingsExt, Settings};
-use log::debug;
+use log::info;
 
-use std::{
-    error::Error,
-    sync::mpsc::{self, Receiver, Sender},
-};
+use std::error::Error;
 use swayipc::{Connection as SwayConnection, Input};
 
 pub struct TouchpadHandler {
     settings: Settings,
     sway_connection: SwayConnection,
-    tx: Sender<Input>,
-    rx: Receiver<Input>,
 }
 impl TouchpadHandler {
     pub fn new() -> TouchpadHandler {
         let settings = Settings::new("org.gnome.desktop.peripherals.touchpad");
         let connection = SwayConnection::new().unwrap();
-        let (tx, rx) = mpsc::channel();
-        let handler = TouchpadHandler {
+        TouchpadHandler {
             settings,
             sway_connection: connection,
-            tx,
-            rx,
-        };
-        handler
+        }
     }
     fn apply_tap(&mut self) -> Result<(), Box<dyn Error>> {
         let tap_enabled: &str = self
@@ -64,7 +55,7 @@ impl TouchpadHandler {
     fn send_events(&mut self) -> Result<(), Box<dyn Error>> {
         let new_val: String = self.settings().get("send-events");
         let cmd = format!("input type:touchpad events {new_val}");
-        debug!("{cmd}");
+        info!("{cmd}");
         self.sway_connection.run_command(cmd)?;
         Ok(())
     }
@@ -75,7 +66,7 @@ impl TouchpadHandler {
             .to_sway_type()
             .to_primitive();
         let cmd = format!("input type:touchpad drag {use_drag_enabled}");
-        debug!("{cmd}");
+        info!("{cmd}");
         self.sway_connection.run_command(cmd)?;
         Ok(())
     }
@@ -86,7 +77,7 @@ impl TouchpadHandler {
             .to_sway_type()
             .to_primitive();
         let cmd = format!("input type:touchpad drag_lock {drag_lock_enabled}");
-        debug!("{cmd}");
+        info!("{cmd}");
         self.sway_connection.run_command(cmd)?;
         Ok(())
     }
@@ -107,11 +98,31 @@ impl PointerMethods for TouchpadHandler {
     fn pointer_type(&self) -> &str {
         "touchpad"
     }
+    fn apply_left_handed(&mut self) -> Result<(), Box<dyn Error>> {
+        let left_handed: String = self.settings().get("left-handed");
+
+        let left_handed_enabled: &str = match left_handed.as_ref() {
+            "left" => true,
+            "right" => false,
+            "mouse" => {
+                let mouse_settings = Settings::new("org.gnome.desktop.peripherals.mouse");
+                mouse_settings.get("left-handed")
+            }
+            _ => false,
+        }
+        .to_sway_type()
+        .to_primitive();
+        let pointer_type = self.pointer_type();
+        let cmd = format!("input type:{pointer_type} left_handed {left_handed_enabled}");
+        info!("{cmd}");
+        self.sway_connection().run_command(cmd)?;
+        Ok(())
+    }
 }
 
 impl InputHandler for TouchpadHandler {
     fn apply_changes(&mut self, key: &str) -> Result<(), Box<dyn Error>> {
-        debug!("{key}");
+        info!("org.gnome.desktop.peripherals.touchpad -> Key: {key} chaged");
         match key {
             "speed" => self.apply_speed()?,
             "natural-scroll" => self.apply_natural_scroll()?,
@@ -129,9 +140,6 @@ impl InputHandler for TouchpadHandler {
         };
         Ok(())
     }
-    fn get_swayinput_tx(&self) -> Sender<Input> {
-        self.tx.clone()
-    }
     fn settings(&self) -> &Settings {
         &self.settings
     }
@@ -140,7 +148,7 @@ impl InputHandler for TouchpadHandler {
     }
     fn apply_all(&mut self) -> Result<(), Box<dyn Error>> {
         self.apply_speed()?;
-        // self.apply_left_handed()?;
+        self.apply_left_handed()?;
         self.apply_natural_scroll()?;
         self.apply_tap()?;
         self.apply_scroll_method()?;
@@ -152,14 +160,15 @@ impl InputHandler for TouchpadHandler {
         Ok(())
     }
     fn sync_gsettings(&mut self, input: Input) -> Result<(), Box<dyn Error>> {
-        debug!("Sync touchpad gsettings");
-        debug!("Received at ");
-        line!();
         self.sync_pointer_gsettings(&input)?;
         if input.libinput.is_none() {
             return Ok(());
         }
         let libinput = input.libinput.unwrap();
+        if let Some(enabled) = libinput.send_events.as_ref() {
+            self.settings()
+                .set_string("send-events", enabled.to_primitive())?;
+        }
         if let Some(tap) = libinput.tap {
             self.settings()
                 .set_boolean("tap-to-click", tap.to_primitive())?;
@@ -172,14 +181,8 @@ impl InputHandler for TouchpadHandler {
             self.settings()
                 .set_boolean("tap-and-drag-lock", drag_lock.to_primitive())?;
         }
-
-        debug!("Exiting touchpad sync gsettings");
         Ok(())
     }
-    fn get_swayinput_rx(&self) -> &Receiver<Input> {
-        &self.rx
-    }
-    fn monitor_sway_inputs(&self) {}
 }
 unsafe impl Send for TouchpadHandler {}
 unsafe impl Sync for TouchpadHandler {}
