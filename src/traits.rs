@@ -61,7 +61,9 @@ pub trait PointerMethods: InputHandler {
             self.settings()
                 .set_boolean("natural-scroll", natural.to_primitive())?;
         }
-
+        if let Some(accel) = libinput.accel_speed {
+            self.settings().set_double("speed", accel)?;
+        }
         Ok(())
     }
 }
