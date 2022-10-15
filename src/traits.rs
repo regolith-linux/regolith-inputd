@@ -61,10 +61,6 @@ pub trait PointerMethods: InputHandler {
             self.settings()
                 .set_boolean("natural-scroll", natural.to_primitive())?;
         }
-        if let Some(left_handed) = libinput.left_handed.as_ref() {
-            self.settings()
-                .set_boolean("left-handed", left_handed.to_primitive())?;
-        }
 
         Ok(())
     }
