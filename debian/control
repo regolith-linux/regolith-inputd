@@ -1,0 +1,16 @@
+Source: regolith-inputd
+Section: unknown
+Priority: optional
+Maintainer: Soumya Ranjan Patnaik <soumyaranjan1812@gmail.com>
+Build-Depends: cargo, ca-certificates, libglib2.0-dev, debhelper-compat (=12)
+Standards-Version: 4.5.0
+Homepage: <https://github.com/regolith-linux/regolith-inputd>
+
+Package: regolith-inputd
+Architecture: any
+Multi-Arch: foreign
+Depends: ${misc:Depends}, ${shlibs:Depends} 
+Recommends: gnome-control-center
+Description: Daemon for synchronizing between 
+  the input states stored in gsettings and sway 
+  by providing relevant dbus bindings
