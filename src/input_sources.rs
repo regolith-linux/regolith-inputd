@@ -25,31 +25,17 @@ impl InputSourcesHandler {
             .map(|(_, layout)| {
                 if layout.contains("+") {
                     let (layout, variant) = layout.split_once("+").unwrap();
-                    (String::from(layout), Some(String::from(variant)))
+                    (String::from(layout), String::from(variant))
                 } else {
-                    (layout, None)
+                    (layout, String::from(""))
                 }
             })
             .reduce(|(layout, variant), (curr_layout, curr_variant)| {
-                let updated_variant = if variant.is_none() && curr_variant.is_some() {
-                    curr_variant
-                } else if variant.is_some() && curr_variant.is_some() {
-                    let curr_variant_val = curr_variant.as_deref().unwrap();
-                    let variant_val = variant.unwrap();
-                    Some(variant_val + "," + curr_variant_val)
-                } else {
-                    variant
-                };
-                (layout + "," + &curr_layout, updated_variant)
+                (layout + "," + &curr_layout, variant + "," + &curr_variant)
             })
             .ok_or("Invalid keyboard layout or variant")?;
-        let variants_str = if let Some(variants) = variants {
-            variants
-        } else {
-            String::new()
-        };
         let layout_cmd = format!("input type:keyboard xkb_layout '{layouts}'");
-        let vairants_cmd = format!("input type:keyboard xkb_variant '{variants_str}'");
+        let vairants_cmd = format!("input type:keyboard xkb_variant '{variants}'");
         info!("{vairants_cmd}");
         info!("{layout_cmd}");
         self.sway_connection().run_command(vairants_cmd)?;
