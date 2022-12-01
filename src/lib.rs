@@ -26,6 +26,18 @@ pub struct SettingsManager {
 // Method Implementations
 impl SettingsManager {
     pub fn new() -> SettingsManager {
+        let mut retry_count = 5;
+        loop {
+            let connection = SwayConnection::new();
+            if connection.is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            retry_count -= 1;
+            if retry_count == 0 {
+                panic!("Failed to start regolith-inputd: cannot connect to sway IPC");
+            }
+        };
         let handlers: HandlerList = Arc::new(Mutex::new([
             Box::new(MouseHandler::new()),
             Box::new(KeyboardHandler::new()),
