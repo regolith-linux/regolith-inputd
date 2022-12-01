@@ -1,2 +1,1 @@
-regolith-inputd.desktop /usr/share/applications/
 target/release/regolith-inputd /usr/bin/
