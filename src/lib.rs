@@ -2,7 +2,9 @@ mod keyboard;
 mod mouse;
 mod touchpad;
 mod traits;
+mod input_sources;
 
+use input_sources::InputSourcesHandler;
 use keyboard::KeyboardHandler;
 use log::{info, warn};
 use mouse::MouseHandler;
@@ -16,7 +18,7 @@ use traits::InputHandler;
 
 // Type Aliases
 type SharedRef<T> = Arc<Mutex<T>>;
-type HandlerList = SharedRef<[Box<dyn InputHandler + Send>; 3]>;
+type HandlerList = SharedRef<[Box<dyn InputHandler + Send>; 4]>;
 
 // Structs
 pub struct SettingsManager {
@@ -42,6 +44,7 @@ impl SettingsManager {
             Box::new(MouseHandler::new()),
             Box::new(KeyboardHandler::new()),
             Box::new(TouchpadHandler::new()),
+            Box::new(InputSourcesHandler::new()),
         ]));
         SettingsManager { handlers }
     }
