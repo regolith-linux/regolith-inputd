@@ -1,3 +1,11 @@
+regolith-inputd (0.2) focal; urgency=medium
+
+  * Added keyboard layout module
+  * Added serde and serde_json packages
+  * Fix state reset on sway reload
+
+ -- soumyarp <soumyaranjan1812@gmail.com>  Fri, 23 Dec 2022 02:33:28 +0530
+
 regolith-inputd (0.1) jammy; urgency=medium
 
   * Initial release. 
