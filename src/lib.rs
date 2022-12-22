@@ -1,18 +1,21 @@
+mod input_sources;
 mod keyboard;
 mod mouse;
 mod touchpad;
 mod traits;
-mod input_sources;
 
 use input_sources::InputSourcesHandler;
 use keyboard::KeyboardHandler;
-use log::{info, warn};
+use log::{info, warn, debug};
 use mouse::MouseHandler;
+use serde::Deserialize;
 use std::error::Error;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use swayipc::{Connection as SwayConnection, Event, EventStream, EventType, Fallible, Input};
+use swayipc::{
+    Connection as SwayConnection, Event, EventStream, EventType, Fallible, Input, TickEvent,
+};
 use touchpad::TouchpadHandler;
 use traits::InputHandler;
 
@@ -25,6 +28,18 @@ pub struct SettingsManager {
     handlers: HandlerList,
 }
 
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+enum SwayReloadStatus {
+    #[serde(rename = "reload_pending")]
+    ReloadPending,
+    #[serde(rename = "reload_done")]
+    ReloadDone,
+}
+
+#[derive(Deserialize, Debug)]
+struct SwayReloadTick {
+    status: SwayReloadStatus,
+}
 // Method Implementations
 impl SettingsManager {
     pub fn new() -> SettingsManager {
@@ -39,7 +54,7 @@ impl SettingsManager {
             if retry_count == 0 {
                 panic!("Failed to start regolith-inputd: cannot connect to sway IPC");
             }
-        };
+        }
         let handlers: HandlerList = Arc::new(Mutex::new([
             Box::new(MouseHandler::new()),
             Box::new(KeyboardHandler::new()),
@@ -74,10 +89,31 @@ impl SettingsManager {
                     }
                 }
             };
+            let mut prev_input_sate = None;
+            let mut sway_connection = SwayConnection::new().unwrap();
             for event in event_stream {
                 match event {
                     Ok(Event::Input(event)) => {
-                        sync_input_gsettings(&mut handlers_sref, event.input).unwrap()
+                        sync_input_gsettings(&mut handlers_sref, &event.input).unwrap()
+                    }
+                    Ok(Event::Tick(TickEvent {
+                        payload,
+                        first: false,
+                        ..
+                    })) => {
+                        let Ok(reload_tick) = serde_json::from_str::<SwayReloadTick>(&payload) else {
+                            debug!("Invalid payload recieved: {payload}");
+                            continue;
+                        };
+                        debug!("Tick recieved: {reload_tick:#?}");
+                        if reload_tick.status == SwayReloadStatus::ReloadPending {
+                            prev_input_sate = sway_connection.get_inputs().ok();
+                        } else if reload_tick.status == SwayReloadStatus::ReloadDone {
+                            for input in prev_input_sate.unwrap().into_iter() {
+                                sync_input_gsettings(&mut handlers_sref, &input).unwrap()
+                            }
+                            prev_input_sate = None;
+                        }
                     }
                     Err(e) => warn!("{e}"),
                     _ => continue,
@@ -89,10 +125,10 @@ impl SettingsManager {
 }
 
 // Functions
-fn sync_input_gsettings(
-    handlers_sref: &mut HandlerList,
-    input: Input,
-) -> Result<(), Box<dyn Error + '_>> {
+fn sync_input_gsettings<'a>(
+    handlers_sref: &'a mut HandlerList,
+    input: &Input,
+) -> Result<(), Box<dyn Error + 'a>> {
     let input_type = input.input_type.clone();
     let handler_index = match input_type.as_ref() {
         "pointer" => 0,
@@ -107,6 +143,6 @@ fn sync_input_gsettings(
 }
 fn get_new_inputevent_stream() -> Fallible<EventStream> {
     let connection = SwayConnection::new()?;
-    let subs = [EventType::Input];
+    let subs = [EventType::Input, EventType::Tick];
     connection.subscribe(subs)
 }

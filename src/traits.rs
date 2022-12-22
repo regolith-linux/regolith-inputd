@@ -10,7 +10,7 @@ pub trait InputHandler {
     fn apply_all(&mut self) -> Result<(), Box<dyn Error>> {
         Ok(())
     }
-    fn sync_gsettings(&mut self, _: Input) -> Result<(), Box<dyn Error>> {
+    fn sync_gsettings(&mut self, _: &Input) -> Result<(), Box<dyn Error>> {
         Ok(())
     }
     fn monitor_gsettings_change(&mut self)

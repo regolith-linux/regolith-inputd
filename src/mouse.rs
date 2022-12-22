@@ -1,5 +1,5 @@
 use crate::traits::{InputHandler, PointerMethods, PrimitiveToSwayType, SwayTypeToPrimitive};
-use gio::{prelude::SettingsExtManual, Settings, traits::SettingsExt};
+use gio::{prelude::SettingsExtManual, traits::SettingsExt, Settings};
 use log::info;
 use std::error::Error;
 use swayipc::{Connection as SwayConnection, Input};
@@ -60,15 +60,16 @@ impl InputHandler for MouseHandler {
         self.apply_natural_scroll()?;
         Ok(())
     }
-    fn sync_gsettings(&mut self, input: Input) -> Result<(), Box<dyn Error>> {
+    fn sync_gsettings(&mut self, input: &Input) -> Result<(), Box<dyn Error>> {
         info!("Syncronizing mouse input state of sway with gsettings...");
         self.sync_pointer_gsettings(&input)?;
         if input.libinput.is_none() {
             return Ok(());
         }
-        let libinput = input.libinput.unwrap();
+        let libinput = input.libinput.as_ref().unwrap();
         if let Some(left_handed) = libinput.left_handed.as_ref() {
-            self.settings().set_boolean("left-handed", left_handed.to_primitive())?;
+            self.settings()
+                .set_boolean("left-handed", left_handed.to_primitive())?;
         }
         Ok(())
     }

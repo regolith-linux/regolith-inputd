@@ -159,25 +159,25 @@ impl InputHandler for TouchpadHandler {
         self.emulate_middle_click()?;
         Ok(())
     }
-    fn sync_gsettings(&mut self, input: Input) -> Result<(), Box<dyn Error>> {
+    fn sync_gsettings(&mut self, input: &Input) -> Result<(), Box<dyn Error>> {
         self.sync_pointer_gsettings(&input)?;
         if input.libinput.is_none() {
             return Ok(());
         }
-        let libinput = input.libinput.unwrap();
+        let libinput = input.libinput.as_ref().unwrap();
         if let Some(enabled) = libinput.send_events.as_ref() {
             self.settings()
                 .set_string("send-events", enabled.to_primitive())?;
         }
-        if let Some(tap) = libinput.tap {
+        if let Some(tap) = &libinput.tap {
             self.settings()
                 .set_boolean("tap-to-click", tap.to_primitive())?;
         }
-        if let Some(drag) = libinput.tap_drag {
+        if let Some(drag) = &libinput.tap_drag {
             self.settings()
                 .set_boolean("tap-and-drag", drag.to_primitive())?;
         }
-        if let Some(drag_lock) = libinput.tap_drag_lock {
+        if let Some(drag_lock) = &libinput.tap_drag_lock {
             self.settings()
                 .set_boolean("tap-and-drag-lock", drag_lock.to_primitive())?;
         }
