@@ -6,7 +6,7 @@ mod traits;
 
 use input_sources::InputSourcesHandler;
 use keyboard::KeyboardHandler;
-use log::{info, warn, debug};
+use log::{debug, info, warn};
 use mouse::MouseHandler;
 use serde::Deserialize;
 use std::error::Error;
@@ -109,8 +109,17 @@ impl SettingsManager {
                         if reload_tick.status == SwayReloadStatus::ReloadPending {
                             prev_input_sate = sway_connection.get_inputs().ok();
                         } else if reload_tick.status == SwayReloadStatus::ReloadDone {
-                            for input in prev_input_sate.unwrap().into_iter() {
-                                sync_input_gsettings(&mut handlers_sref, &input).unwrap()
+                            let Some(prev_input_sate_vec) = prev_input_sate else {
+                                warn!("Previous state not saved. Not restoring after reload");
+                                continue;
+                            };
+                            for input in prev_input_sate_vec.into_iter() {
+                                if let Err(e) = sync_input_gsettings(&mut handlers_sref, &input) {
+                                    info!(
+                                        "Cannot apply input gsetting for sway input device {}: {e}",
+                                        input.identifier
+                                    )
+                                }
                             }
                             prev_input_sate = None;
                         }
