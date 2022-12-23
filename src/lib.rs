@@ -101,7 +101,11 @@ impl SettingsManager {
                         first: false,
                         ..
                     })) => {
-                        let Ok(reload_tick) = serde_json::from_str::<SwayReloadTick>(&payload) else {
+                        let reload_tick = if let Ok(reload_tick) =
+                            serde_json::from_str::<SwayReloadTick>(&payload)
+                        {
+                            reload_tick
+                        } else {
                             debug!("Invalid payload recieved: {payload}");
                             continue;
                         };
@@ -109,10 +113,13 @@ impl SettingsManager {
                         if reload_tick.status == SwayReloadStatus::ReloadPending {
                             prev_input_sate = sway_connection.get_inputs().ok();
                         } else if reload_tick.status == SwayReloadStatus::ReloadDone {
-                            let Some(prev_input_sate_vec) = prev_input_sate else {
-                                warn!("Previous state not saved. Not restoring after reload");
-                                continue;
-                            };
+                            let prev_input_sate_vec =
+                                if let Some(prev_input_sate_vec) = prev_input_sate {
+                                    prev_input_sate_vec
+                                } else {
+                                    warn!("Previous state not saved. Not restoring after reload");
+                                    continue;
+                                };
                             for input in prev_input_sate_vec.into_iter() {
                                 if let Err(e) = sync_input_gsettings(&mut handlers_sref, &input) {
                                     info!(
@@ -150,8 +157,10 @@ fn sync_input_gsettings<'a>(
     handlers_lock[handler_index].sync_gsettings(input)?;
     Ok(())
 }
+
 fn get_new_inputevent_stream() -> Fallible<EventStream> {
     let connection = SwayConnection::new()?;
     let subs = [EventType::Input, EventType::Tick];
     connection.subscribe(subs)
 }
+
