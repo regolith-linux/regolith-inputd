@@ -89,12 +89,13 @@ impl SettingsManager {
                     }
                 }
             };
-            let mut prev_input_sate = None;
-            let mut sway_connection = SwayConnection::new().unwrap();
+            let mut is_allow_sync = true;
             for event in event_stream {
                 match event {
                     Ok(Event::Input(event)) => {
-                        sync_input_gsettings(&mut handlers_sref, &event.input).unwrap()
+                        if is_allow_sync {
+                            sync_input_gsettings(&mut handlers_sref, &event.input).unwrap()
+                        }
                     }
                     Ok(Event::Tick(TickEvent {
                         payload,
@@ -111,24 +112,9 @@ impl SettingsManager {
                         };
                         debug!("Tick recieved: {reload_tick:#?}");
                         if reload_tick.status == SwayReloadStatus::ReloadPending {
-                            prev_input_sate = sway_connection.get_inputs().ok();
+                            is_allow_sync = false
                         } else if reload_tick.status == SwayReloadStatus::ReloadDone {
-                            let prev_input_sate_vec =
-                                if let Some(prev_input_sate_vec) = prev_input_sate {
-                                    prev_input_sate_vec
-                                } else {
-                                    warn!("Previous state not saved. Not restoring after reload");
-                                    continue;
-                                };
-                            for input in prev_input_sate_vec.into_iter() {
-                                if let Err(e) = sync_input_gsettings(&mut handlers_sref, &input) {
-                                    info!(
-                                        "Cannot apply input gsetting for sway input device {}: {e}",
-                                        input.identifier
-                                    )
-                                }
-                            }
-                            prev_input_sate = None;
+                            is_allow_sync = true
                         }
                     }
                     Err(e) => warn!("{e}"),
@@ -163,4 +149,3 @@ fn get_new_inputevent_stream() -> Fallible<EventStream> {
     let subs = [EventType::Input, EventType::Tick];
     connection.subscribe(subs)
 }
-
