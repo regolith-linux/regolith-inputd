@@ -48,5 +48,11 @@ impl InputHandler for KeyboardHandler {
     fn sway_connection(&mut self) -> &mut swayipc::Connection {
         &mut self.sway_connection
     }
+    fn apply_all(&mut self) -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
+    fn sync_gsettings(&mut self, _: &swayipc::Input) -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
 }
 unsafe impl Send for KeyboardHandler {}

@@ -3,16 +3,13 @@ use gio::{traits::SettingsExt, Settings};
 use log::error;
 use std::error::Error;
 use swayipc::{Connection as SwayConnection, EnabledOrDisabled, Input, SendEvents};
+
 pub trait InputHandler {
     fn settings(&self) -> &Settings;
     fn sway_connection(&mut self) -> &mut SwayConnection;
     fn apply_changes(&mut self, _: &str) -> Result<(), Box<dyn Error>>;
-    fn apply_all(&mut self) -> Result<(), Box<dyn Error>> {
-        Ok(())
-    }
-    fn sync_gsettings(&mut self, _: &Input) -> Result<(), Box<dyn Error>> {
-        Ok(())
-    }
+    fn apply_all(&mut self) -> Result<(), Box<dyn Error>>;
+    fn sync_gsettings(&mut self, _: &Input) -> Result<(), Box<dyn Error>>;
     fn monitor_gsettings_change(&mut self)
     where
         Self: 'static,
