@@ -160,7 +160,7 @@ impl InputHandler for TouchpadHandler {
         Ok(())
     }
     fn sync_gsettings(&mut self, input: &Input) -> Result<(), Box<dyn Error>> {
-        self.sync_pointer_gsettings(&input)?;
+        self.sync_pointer_gsettings(input)?;
         if input.libinput.is_none() {
             return Ok(());
         }

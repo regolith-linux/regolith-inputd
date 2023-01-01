@@ -103,10 +103,7 @@ impl PrimitiveToSwayType<EnabledOrDisabled> for bool {
 
 impl SwayTypeToPrimitive<bool> for SendEvents {
     fn to_primitive(&self) -> bool {
-        match self {
-            SendEvents::Enabled => true,
-            _ => false,
-        }
+        matches!(self, SendEvents::Enabled)
     }
 }
 

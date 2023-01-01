@@ -17,6 +17,7 @@ use std::time::Duration;
 use swayipc::{Connection as SwayConnection, Event, TickEvent};
 use touchpad::TouchpadHandler;
 use traits::InputHandler;
+use log::info;
 
 // Type Aliases
 type SharedRef<T> = Arc<Mutex<T>>;
@@ -42,7 +43,7 @@ struct SwayReloadTick {
 // Method Implementations
 impl SettingsManager {
     pub fn new() -> SettingsManager {
-        utils::retry_action(|| SwayConnection::new(), 5, Duration::from_millis(500));
+        utils::retry_action(SwayConnection::new, 5, Duration::from_millis(500));
         let handlers: HandlerList = Arc::new(Mutex::new([
             Box::new(MouseHandler::new()),
             Box::new(KeyboardHandler::new()),
@@ -66,7 +67,7 @@ impl SettingsManager {
 
     fn monitor_swayinput_events(mut handlers_sref: HandlerList) {
         let event_stream = utils::retry_action(
-            || utils::get_new_inputevent_stream(),
+            utils::get_new_inputevent_stream,
             5,
             Duration::from_millis(500),
         );
@@ -85,8 +86,18 @@ impl SettingsManager {
                     match serde_json::from_str::<SwayReloadTick>(&payload) {
                         Ok(SwayReloadTick {
                             status: ReloadPending,
-                        }) => is_allow_sync = false,
-                        Ok(SwayReloadTick { status: ReloadDone }) => is_allow_sync = true,
+                        }) => {
+                            is_allow_sync = false;
+                            info!("Recieved tick, allow_sync = {is_allow_sync}");
+                        }
+                        Ok(SwayReloadTick { status: ReloadDone }) => {
+                            is_allow_sync = true;
+                            info!("Sway reload done - Reapplying configurations from gsettings");
+                            let mut handlers_lock = handlers_sref.lock().expect("Acquired lock for handers_sref");
+                            for handle in handlers_lock.iter_mut() {
+                                handle.apply_all().expect("Failed to re-apply configs from gsettings");
+                            }
+                        }
                         Err(e) => debug!("Invalid Payload Recieved: {e}"),
                     }
                 }
@@ -94,6 +105,12 @@ impl SettingsManager {
                 _ => continue,
             }
         }
+    }
+}
+
+impl Default for SettingsManager {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

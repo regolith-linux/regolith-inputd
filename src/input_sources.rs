@@ -23,8 +23,8 @@ impl InputSourcesHandler {
         let (layouts, variants) = delay
             .into_iter()
             .map(|(_, layout)| {
-                if layout.contains("+") {
-                    let (layout, variant) = layout.split_once("+").unwrap();
+                if layout.contains('+') {
+                    let (layout, variant) = layout.split_once('+').unwrap();
                     (String::from(layout), String::from(variant))
                 } else {
                     (layout, String::from(""))
@@ -47,9 +47,8 @@ impl InputSourcesHandler {
 impl InputHandler for InputSourcesHandler {
     fn apply_changes(&mut self, key: &str) -> Result<(), Box<dyn Error>> {
         info!("org.gnome.desktop.input-sources -> Key: {key} chaged");
-        match key {
-            "sources" => self.apply_input_sources()?,
-            _ => (),
+        if key == "sources" {
+            self.apply_input_sources()?
         };
         Ok(())
     }
