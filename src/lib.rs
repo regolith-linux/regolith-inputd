@@ -91,6 +91,7 @@ impl SettingsManager {
                             info!("Recieved tick, allow_sync = {is_allow_sync}");
                         }
                         Ok(SwayReloadTick { status: ReloadDone }) => {
+                            thread::sleep(Duration::from_millis(100));
                             is_allow_sync = true;
                             info!("Sway reload done - Reapplying configurations from gsettings");
                             let mut handlers_lock = handlers_sref.lock().expect("Acquired lock for handers_sref");
