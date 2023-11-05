@@ -1,6 +1,6 @@
-use log::{error, warn, info};
-use swayipc::{Input, Fallible, EventStream, Connection as SwayConnection, EventType};
-use std::{fmt::Display, thread, error::Error, time::Duration};
+use log::{error, info, warn};
+use std::{error::Error, fmt::Display, thread, time::Duration};
+use swayipc::{Connection as SwayConnection, EventStream, EventType, Fallible, Input};
 
 use crate::HandlerList;
 

@@ -7,6 +7,7 @@ mod utils;
 
 use input_sources::InputSourcesHandler;
 use keyboard::KeyboardHandler;
+use log::info;
 use log::{debug, warn};
 use mouse::MouseHandler;
 use serde::Deserialize;
@@ -17,7 +18,6 @@ use std::time::Duration;
 use swayipc::{Connection as SwayConnection, Event, TickEvent};
 use touchpad::TouchpadHandler;
 use traits::InputHandler;
-use log::info;
 
 // Type Aliases
 type SharedRef<T> = Arc<Mutex<T>>;
@@ -94,9 +94,13 @@ impl SettingsManager {
                             thread::sleep(Duration::from_millis(100));
                             is_allow_sync = true;
                             info!("Sway reload done - Reapplying configurations from gsettings");
-                            let mut handlers_lock = handlers_sref.lock().expect("Acquired lock for handers_sref");
+                            let mut handlers_lock = handlers_sref
+                                .lock()
+                                .expect("Acquired lock for handers_sref");
                             for handle in handlers_lock.iter_mut() {
-                                handle.apply_all().expect("Failed to re-apply configs from gsettings");
+                                handle
+                                    .apply_all()
+                                    .expect("Failed to re-apply configs from gsettings");
                             }
                         }
                         Err(e) => debug!("Invalid Payload Recieved: {e}"),
@@ -114,4 +118,3 @@ impl Default for SettingsManager {
         Self::new()
     }
 }
-
