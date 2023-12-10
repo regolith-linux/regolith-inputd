@@ -17,7 +17,7 @@ pub fn sync_input_gsettings<'a>(
     };
     info!("Recieved Sway InputEvent for {}", input.input_type);
     let mut handlers_lock = handlers_sref.lock()?;
-    handlers_lock[handler_index].sync_gsettings(input)?;
+    handlers_lock[handler_index].sync_gsettings_sync(input)?;
     Ok(())
 }
 

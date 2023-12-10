@@ -2,7 +2,12 @@ use gio::prelude::SettingsExtManual;
 use gio::{traits::SettingsExt, Settings};
 use log::error;
 use std::error::Error;
+use std::sync::atomic::Ordering;
+use std::thread;
+use std::time::Duration;
 use swayipc::{Connection as SwayConnection, EnabledOrDisabled, Input, SendEvents};
+
+use crate::{ALLOW_GSETTINGS_APPLY, ALLOW_SWAYINPUT_APPLY};
 
 pub trait InputHandler {
     fn settings(&self) -> &Settings;
@@ -10,6 +15,60 @@ pub trait InputHandler {
     fn apply_changes(&mut self, _: &str) -> Result<(), Box<dyn Error>>;
     fn apply_all(&mut self) -> Result<(), Box<dyn Error>>;
     fn sync_gsettings(&mut self, _: &Input) -> Result<(), Box<dyn Error>>;
+
+    fn apply_changes_sync(&mut self, key: &str) -> Result<(), Box<dyn Error>> {
+        unsafe {
+            ALLOW_SWAYINPUT_APPLY.store(false, Ordering::Relaxed);
+        }
+        let result = self.apply_changes(key);
+
+        thread::sleep(Duration::from_millis(100));
+
+        unsafe {
+            let allow = ALLOW_SWAYINPUT_APPLY.load(Ordering::Relaxed) && true;
+            ALLOW_SWAYINPUT_APPLY.store(allow, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn apply_all_sync(&mut self) -> Result<(), Box<dyn Error>> {
+        unsafe {
+            if !ALLOW_GSETTINGS_APPLY.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            ALLOW_SWAYINPUT_APPLY.store(false, Ordering::Relaxed);
+        }
+
+        let result = self.apply_all();
+
+        thread::sleep(Duration::from_millis(100));
+
+        unsafe {
+            let allow = ALLOW_SWAYINPUT_APPLY.load(Ordering::Relaxed) && true;
+            ALLOW_SWAYINPUT_APPLY.store(allow, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn sync_gsettings_sync(&mut self, _: &Input) -> Result<(), Box<dyn Error>> {
+        unsafe {
+            if !ALLOW_SWAYINPUT_APPLY.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            ALLOW_GSETTINGS_APPLY.store(false, Ordering::Relaxed);
+        }
+
+        let result = self.apply_all();
+
+        thread::sleep(Duration::from_millis(100));
+
+        unsafe {
+            let allow = ALLOW_GSETTINGS_APPLY.load(Ordering::Relaxed) && true;
+            ALLOW_GSETTINGS_APPLY.store(allow, Ordering::Relaxed);
+        }
+        result
+    }
+
     fn monitor_gsettings_change(&mut self)
     where
         Self: 'static,
@@ -17,7 +76,7 @@ pub trait InputHandler {
         let ptr: *mut Self = self;
         self.settings().connect_changed(None, move |_, key| unsafe {
             if !ptr.is_null() {
-                if let Err(e) = (*ptr).apply_changes(key) {
+                if let Err(e) = (*ptr).apply_changes_sync(key) {
                     error!("{e}");
                 };
             }
