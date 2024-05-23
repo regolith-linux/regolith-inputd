@@ -18,9 +18,9 @@ impl InputSourcesHandler {
         }
     }
     fn apply_input_sources(&mut self) -> Result<(), Box<dyn Error>> {
-        let delay: Vec<(String, String)> = self.settings().get("sources");
+        let sources: Vec<(String, String)> = self.settings().get("sources");
         // Layout is of form code+variant
-        let (layouts, variants) = delay
+        let (layouts, variants) = sources
             .into_iter()
             .map(|(_, layout)| {
                 if layout.contains('+') {
