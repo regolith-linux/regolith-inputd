@@ -1,3 +1,11 @@
+regolith-inputd (0.3.0) jammy; urgency=medium
+
+  [ Soumya Ranjan Patnaik ]
+  * fix: rename var delay -> sources
+  * feat: add systemd service
+
+ -- Regolith Linux <regolith.linux@gmail.com>  Sun, 02 Jun 2024 10:52:16 -0700
+
 regolith-inputd (0.2.3) jammy; urgency=medium
 
   [ Soumya Ranjan Patnaik ]
