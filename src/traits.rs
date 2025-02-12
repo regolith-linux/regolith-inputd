@@ -122,6 +122,7 @@ pub trait PointerMethods: InputHandler {
         }
         Ok(())
     }
+   fn apply_click_method(&mut self) -> Result<(), Box<dyn Error>>;
 }
 
 pub trait SwayTypeToPrimitive<T> {
