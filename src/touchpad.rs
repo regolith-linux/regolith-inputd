@@ -118,6 +118,29 @@ impl PointerMethods for TouchpadHandler {
         self.sway_connection().run_command(cmd)?;
         Ok(())
     }
+
+    /**
+     * See https://manpages.debian.org/experimental/sway/sway-input.5.en.html
+     * 
+     * How to generate software-emulated buttons, either disabled (“none”), 
+     * through specific areas (“areas”), number of fingers (“fingers”) or 
+     * left as hardware default (“default”).
+     */
+    fn apply_click_method(&mut self) -> Result<(), Box<dyn Error>> {
+        let click_method: String = self.settings().get("click-method");
+
+        let click_method: &str = match click_method.as_ref() {
+            "areas" => "button_areas",
+            "fingers" => "clickfinger",
+            _ => "none",
+        };
+        
+        let pointer_type = self.pointer_type();
+        let cmd = format!("input type:{pointer_type} click_method {click_method}");
+        info!("{cmd}");
+        self.sway_connection().run_command(cmd)?;
+        Ok(())
+    }
 }
 
 impl InputHandler for TouchpadHandler {
@@ -136,6 +159,7 @@ impl InputHandler for TouchpadHandler {
             "tap-and-drag" => self.use_drag()?,
             "tap-and-drag-lock" => self.use_drag_lock()?,
             "middle-click-emulation" => self.emulate_middle_click()?,
+            "click_method" => self.apply_click_method()?,
             _ => (),
         };
         Ok(())
