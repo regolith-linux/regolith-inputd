@@ -2,12 +2,17 @@ use crate::traits::{InputHandler, PointerMethods, PrimitiveToSwayType, SwayTypeT
 use gio::{prelude::SettingsExtManual, traits::SettingsExt, Settings};
 use log::info;
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use swayipc::{Connection as SwayConnection, Input};
 
 pub struct TouchpadHandler {
     settings: Settings,
     sway_connection: SwayConnection,
+    /// Click method of each touchpad, by identifier, before the daemon
+    /// first set one; what GNOME's "default" restores.
+    default_click_methods: BTreeMap<String, &'static str>,
+    click_method_set: bool,
 }
 impl TouchpadHandler {
     pub fn new() -> TouchpadHandler {
@@ -16,7 +21,23 @@ impl TouchpadHandler {
         TouchpadHandler {
             settings,
             sway_connection: connection,
+            default_click_methods: BTreeMap::new(),
+            click_method_set: false,
         }
+    }
+    /// Remember the click method of touchpads not seen before.
+    fn remember_default_click_methods(&mut self) -> Result<(), Box<dyn Error>> {
+        for input in self.sway_connection.get_inputs()? {
+            if input.input_type != "touchpad" {
+                continue;
+            }
+            if let Some(method) = input.libinput.and_then(|l| l.click_method) {
+                self.default_click_methods
+                    .entry(input.identifier)
+                    .or_insert_with(|| method.to_primitive());
+            }
+        }
+        Ok(())
     }
     fn apply_tap(&mut self) -> Result<(), Box<dyn Error>> {
         let tap_enabled: &str = self
@@ -119,27 +140,53 @@ impl PointerMethods for TouchpadHandler {
         Ok(())
     }
 
-    /**
-     * See https://manpages.debian.org/experimental/sway/sway-input.5.en.html
-     * 
-     * How to generate software-emulated buttons, either disabled (“none”), 
-     * through specific areas (“areas”), number of fingers (“fingers”) or 
-     * left as hardware default (“default”).
-     */
     fn apply_click_method(&mut self) -> Result<(), Box<dyn Error>> {
         let click_method: String = self.settings().get("click-method");
-
-        let click_method: &str = match click_method.as_ref() {
-            "areas" => "button_areas",
-            "fingers" => "clickfinger",
-            _ => "none",
-        };
-        
-        let pointer_type = self.pointer_type();
-        let cmd = format!("input type:{pointer_type} click_method {click_method}");
-        info!("{cmd}");
-        self.sway_connection().run_command(cmd)?;
+        self.remember_default_click_methods()?;
+        let commands = click_method_commands(
+            &click_method,
+            self.click_method_set,
+            &self.default_click_methods,
+        );
+        self.click_method_set |= sway_click_method(&click_method).is_some();
+        for cmd in commands {
+            info!("{cmd}");
+            self.sway_connection().run_command(cmd)?;
+        }
         Ok(())
+    }
+}
+
+/// sway's `click_method` for a GNOME `click-method` value, or `None` for
+/// "default" (the device's own default), which sway has no value for.
+fn sway_click_method(gnome_value: &str) -> Option<&'static str> {
+    match gnome_value {
+        "areas" => Some("button_areas"),
+        "fingers" => Some("clickfinger"),
+        "none" => Some("none"),
+        _ => None,
+    }
+}
+
+/// Commands that apply a GNOME `click-method` value to every touchpad.
+///
+/// "default" cannot be expressed as a sway setting, and sway cannot unset
+/// one. Until the daemon has set a click method there is nothing to undo,
+/// so "default" leaves each touchpad as libinput or the user's sway config
+/// set it. After that it restores, per touchpad, what sway reported
+/// before the daemon's first change.
+fn click_method_commands(
+    gnome_value: &str,
+    already_set: bool,
+    defaults: &BTreeMap<String, &'static str>,
+) -> Vec<String> {
+    match sway_click_method(gnome_value) {
+        Some(method) => vec![format!("input type:touchpad click_method {method}")],
+        None if already_set => defaults
+            .iter()
+            .map(|(identifier, method)| format!("input \"{identifier}\" click_method {method}"))
+            .collect(),
+        None => Vec::new(),
     }
 }
 
@@ -159,7 +206,7 @@ impl InputHandler for TouchpadHandler {
             "tap-and-drag" => self.use_drag()?,
             "tap-and-drag-lock" => self.use_drag_lock()?,
             "middle-click-emulation" => self.emulate_middle_click()?,
-            "click_method" => self.apply_click_method()?,
+            "click-method" => self.apply_click_method()?,
             _ => (),
         };
         Ok(())
@@ -181,6 +228,7 @@ impl InputHandler for TouchpadHandler {
         self.use_drag()?;
         self.use_drag_lock()?;
         self.emulate_middle_click()?;
+        self.apply_click_method()?;
         Ok(())
     }
     fn sync_gsettings(&mut self, input: &Input) -> Result<(), Box<dyn Error>> {
@@ -210,3 +258,36 @@ impl InputHandler for TouchpadHandler {
 }
 unsafe impl Send for TouchpadHandler {}
 unsafe impl Sync for TouchpadHandler {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gnome_click_methods_map_to_sway() {
+        assert_eq!(sway_click_method("areas"), Some("button_areas"));
+        assert_eq!(sway_click_method("fingers"), Some("clickfinger"));
+        assert_eq!(sway_click_method("none"), Some("none"));
+        assert_eq!(sway_click_method("default"), None);
+    }
+
+    #[test]
+    fn default_restores_each_touchpad_only_after_a_change() {
+        let defaults = BTreeMap::from([
+            ("1:2:Pad_A".to_string(), "button_areas"),
+            ("3:4:Pad_B".to_string(), "clickfinger"),
+        ]);
+        assert!(click_method_commands("default", false, &defaults).is_empty());
+        assert_eq!(
+            click_method_commands("default", true, &defaults),
+            [
+                "input \"1:2:Pad_A\" click_method button_areas",
+                "input \"3:4:Pad_B\" click_method clickfinger",
+            ]
+        );
+        assert_eq!(
+            click_method_commands("fingers", true, &defaults),
+            ["input type:touchpad click_method clickfinger"]
+        );
+    }
+}

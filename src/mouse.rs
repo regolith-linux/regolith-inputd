@@ -35,7 +35,7 @@ impl PointerMethods for MouseHandler {
         self.sway_connection().run_command(cmd)?;
         Ok(())
     }
-    
+
     fn apply_click_method(&mut self) -> Result<(), Box<dyn Error>> {
         Ok(())
     }
