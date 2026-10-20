@@ -19,6 +19,10 @@ impl InputSourcesHandler {
     }
     fn apply_input_sources(&mut self) -> Result<(), Box<dyn Error>> {
         let sources: Vec<(String, String)> = self.settings().get("sources");
+        if sources.is_empty() {
+            info!("No input sources set in GNOME, keeping sway's keyboard layout");
+            return Ok(());
+        }
         // Layout is of form code+variant
         let (layouts, variants) = sources
             .into_iter()
