@@ -195,6 +195,7 @@ impl InputHandler for TouchpadHandler {
         info!("org.gnome.desktop.peripherals.touchpad -> Key: {key} chaged");
         match key {
             "speed" => self.apply_speed()?,
+            "accel-profile" => self.apply_accel_profile()?,
             "natural-scroll" => self.apply_natural_scroll()?,
             "tap-to-click" => self.apply_tap()?,
             "two-finger-scrolling-enabled" | "edge-scrolling-enabled" => {
@@ -219,6 +220,7 @@ impl InputHandler for TouchpadHandler {
     }
     fn apply_all(&mut self) -> Result<(), Box<dyn Error>> {
         self.apply_speed()?;
+        self.apply_accel_profile()?;
         self.apply_left_handed()?;
         self.apply_natural_scroll()?;
         self.apply_tap()?;
