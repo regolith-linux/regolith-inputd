@@ -184,6 +184,20 @@ impl Daemon {
     }
 }
 
+/// Whether the installed GSettings schema `schema` has `key`. Keys are added
+/// over GNOME releases, so older distributions lack some of them.
+pub fn schema_has_key(schema: &str, key: &str) -> bool {
+    let output = Command::new("gsettings")
+        .args(["list-keys", schema])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "gsettings list-keys {schema}");
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .any(|k| k == key)
+}
+
 /// Change a key and return the first command sway gets afterwards that
 /// starts with `prefix`.
 pub fn change(
