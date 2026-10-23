@@ -46,18 +46,41 @@ impl InputSourcesHandler {
         self.sway_connection().run_command(layout_cmd)?;
         Ok(())
     }
+    /// Apply GNOME's XKB options (compose key, alternate characters key and
+    /// the like). An empty list is only sent when the user changes the key:
+    /// at startup and after a sway reload it means GNOME has no options, and
+    /// any set in the user's sway config are kept.
+    fn apply_xkb_options(&mut self, changed: bool) -> Result<(), Box<dyn Error>> {
+        let options: Vec<String> = self.settings().get("xkb-options");
+        if options.is_empty() && !changed {
+            return Ok(());
+        }
+        let cmd = xkb_options_command(&options);
+        info!("{cmd}");
+        self.sway_connection().run_command(cmd)?;
+        Ok(())
+    }
+}
+
+/// The options are quoted because sway splits an unquoted command at
+/// commas and would run every option after the first as a command.
+fn xkb_options_command(options: &[String]) -> String {
+    format!("input type:keyboard xkb_options '{}'", options.join(","))
 }
 
 impl InputHandler for InputSourcesHandler {
     fn apply_changes(&mut self, key: &str) -> Result<(), Box<dyn Error>> {
         info!("org.gnome.desktop.input-sources -> Key: {key} chaged");
-        if key == "sources" {
-            self.apply_input_sources()?
+        match key {
+            "sources" => self.apply_input_sources()?,
+            "xkb-options" => self.apply_xkb_options(true)?,
+            _ => (),
         };
         Ok(())
     }
     fn apply_all(&mut self) -> Result<(), Box<dyn Error>> {
-        self.apply_input_sources()
+        self.apply_input_sources()?;
+        self.apply_xkb_options(false)
     }
     fn settings(&self) -> &Settings {
         &self.settings
@@ -71,3 +94,21 @@ impl InputHandler for InputSourcesHandler {
     }
 }
 unsafe impl Send for InputSourcesHandler {}
+
+#[cfg(test)]
+mod tests {
+    use super::xkb_options_command;
+
+    #[test]
+    fn xkb_options_are_joined_and_quoted() {
+        let options = ["compose:ralt".to_string(), "lv3:menu_switch".to_string()];
+        assert_eq!(
+            xkb_options_command(&options),
+            "input type:keyboard xkb_options 'compose:ralt,lv3:menu_switch'"
+        );
+        assert_eq!(
+            xkb_options_command(&[]),
+            "input type:keyboard xkb_options ''"
+        );
+    }
+}
