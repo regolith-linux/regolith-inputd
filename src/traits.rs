@@ -5,7 +5,7 @@ use std::error::Error;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
-use swayipc::{Connection as SwayConnection, EnabledOrDisabled, Input, SendEvents};
+use swayipc::{ClickMethod, Connection as SwayConnection, EnabledOrDisabled, Input, SendEvents};
 
 use crate::{ALLOW_GSETTINGS_APPLY, ALLOW_SWAYINPUT_APPLY};
 
@@ -122,7 +122,7 @@ pub trait PointerMethods: InputHandler {
         }
         Ok(())
     }
-   fn apply_click_method(&mut self) -> Result<(), Box<dyn Error>>;
+    fn apply_click_method(&mut self) -> Result<(), Box<dyn Error>>;
 }
 
 pub trait SwayTypeToPrimitive<T> {
@@ -172,6 +172,16 @@ impl SwayTypeToPrimitive<&str> for SendEvents {
         match self {
             SendEvents::Enabled => "enabled",
             _ => "disabled",
+        }
+    }
+}
+
+impl SwayTypeToPrimitive<&str> for ClickMethod {
+    fn to_primitive(&self) -> &'static str {
+        match self {
+            ClickMethod::ButtonAreas => "button_areas",
+            ClickMethod::Clickfinger => "clickfinger",
+            _ => "none",
         }
     }
 }
