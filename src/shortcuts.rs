@@ -234,6 +234,8 @@ impl ShortcutsState {
 
 pub struct ShortcutsHandler {
     settings: Settings,
+    /// The entries of `BUILTIN_SHORTCUTS` that the installed schema has.
+    builtin_shortcuts: Vec<(&'static str, &'static str)>,
     // Settings callbacks run on the GLib main loop while a sway reload
     // re-applies everything from the event thread.
     state: Mutex<ShortcutsState>,
@@ -244,10 +246,20 @@ impl ShortcutsHandler {
     /// installed, leaving nothing to mirror.
     pub fn new() -> Option<ShortcutsHandler> {
         let source = SettingsSchemaSource::default()?;
-        source.lookup(MEDIA_KEYS_SCHEMA, true)?;
+        let schema = source.lookup(MEDIA_KEYS_SCHEMA, true)?;
         source.lookup(CUSTOM_KEYBINDING_SCHEMA, true)?;
+        // Not every build of the schema has every key (`terminal` is an
+        // Ubuntu addition), and GSettings aborts the process when asked for
+        // a key its schema lacks.
+        let (builtin_shortcuts, missing): (Vec<_>, Vec<_>) = BUILTIN_SHORTCUTS
+            .into_iter()
+            .partition(|(key, _)| schema.has_key(key));
+        for (key, _) in missing {
+            info!("{MEDIA_KEYS_SCHEMA} has no key {key}, not mirroring it");
+        }
         Some(ShortcutsHandler {
             settings: Settings::new(MEDIA_KEYS_SCHEMA),
+            builtin_shortcuts,
             state: Mutex::new(ShortcutsState {
                 sway_connection: SwayConnection::new().unwrap(),
                 custom_entries: BTreeMap::new(),
@@ -308,7 +320,7 @@ impl ShortcutsHandler {
     /// argument it runs.
     fn wanted_bindings(&self, state: &ShortcutsState) -> BTreeMap<Binding, String> {
         let mut wanted = BTreeMap::new();
-        for (key, command) in BUILTIN_SHORTCUTS {
+        for &(key, command) in &self.builtin_shortcuts {
             let accelerators: Vec<String> = self.settings.get(key);
             for accelerator in accelerators.iter().filter(|a| !a.is_empty()) {
                 match parse_accelerator(accelerator) {
@@ -354,7 +366,7 @@ impl InputHandler for ShortcutsHandler {
             .sway_connection
     }
     fn apply_changes(&mut self, key: &str) -> Result<(), Box<dyn Error>> {
-        if key == CUSTOM_KEYBINDINGS_KEY || BUILTIN_SHORTCUTS.iter().any(|(k, _)| *k == key) {
+        if key == CUSTOM_KEYBINDINGS_KEY || self.builtin_shortcuts.iter().any(|(k, _)| *k == key) {
             info!("{MEDIA_KEYS_SCHEMA} -> Key: {key} changed");
             self.refresh(false)?;
         }
