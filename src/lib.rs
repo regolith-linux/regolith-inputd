@@ -2,6 +2,7 @@ mod cursor;
 mod input_sources;
 mod keyboard;
 mod mouse;
+mod shortcuts;
 mod touchpad;
 mod traits;
 mod utils;
@@ -13,6 +14,7 @@ use log::info;
 use log::{debug, warn};
 use mouse::MouseHandler;
 use serde::Deserialize;
+use shortcuts::ShortcutsHandler;
 use std::error::Error;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -29,7 +31,7 @@ static mut ALLOW_GSETTINGS_APPLY: AtomicBool = AtomicBool::new(true);
 
 // Type Aliases
 type SharedRef<T> = Arc<Mutex<T>>;
-type HandlerList = SharedRef<[Box<dyn InputHandler + Send>; 5]>;
+type HandlerList = SharedRef<Vec<Box<dyn InputHandler + Send>>>;
 
 // Structs
 pub struct SettingsManager {
@@ -52,14 +54,20 @@ struct SwayReloadTick {
 impl SettingsManager {
     pub fn new() -> SettingsManager {
         utils::retry_action(SwayConnection::new, 5, Duration::from_millis(500));
-        let handlers: HandlerList = Arc::new(Mutex::new([
+        let mut handlers: Vec<Box<dyn InputHandler + Send>> = vec![
             Box::new(MouseHandler::new()),
             Box::new(KeyboardHandler::new()),
             Box::new(TouchpadHandler::new()),
             Box::new(InputSourcesHandler::new()),
             Box::new(CursorHandler::new()),
-        ]));
-        SettingsManager { handlers }
+        ];
+        match ShortcutsHandler::new() {
+            Some(shortcuts) => handlers.push(Box::new(shortcuts)),
+            None => warn!("Media keys schema not found, keyboard shortcuts are not mirrored"),
+        }
+        SettingsManager {
+            handlers: Arc::new(Mutex::new(handlers)),
+        }
     }
 
     pub fn start_monitoring(&mut self) -> Result<(), Box<dyn Error + '_>> {
