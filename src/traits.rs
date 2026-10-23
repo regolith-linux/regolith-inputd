@@ -1,13 +1,37 @@
 use gio::prelude::SettingsExtManual;
 use gio::{traits::SettingsExt, Settings};
-use log::error;
+use log::{error, info};
+use std::collections::BTreeSet;
 use std::error::Error;
+use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 use swayipc::{ClickMethod, Connection as SwayConnection, EnabledOrDisabled, Input, SendEvents};
 
 use crate::{ALLOW_GSETTINGS_APPLY, ALLOW_SWAYINPUT_APPLY};
+
+/// Pointer types whose acceleration profile the daemon has set.
+static ACCEL_PROFILE_SET: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// The command that applies a GNOME `accel-profile` value to every device of
+/// `pointer_type`. "default" means the device's own default, which sway has
+/// no value for: until the daemon has set a profile there is nothing to
+/// undo, so it leaves the devices as libinput or the user's sway config set
+/// them; after that it restores adaptive, libinput's default profile.
+pub fn accel_profile_command(
+    pointer_type: &str,
+    gnome_value: &str,
+    already_set: bool,
+) -> Option<String> {
+    let profile = match gnome_value {
+        "flat" => "flat",
+        "adaptive" => "adaptive",
+        _ if already_set => "adaptive",
+        _ => return None,
+    };
+    Some(format!("input type:{pointer_type} accel_profile {profile}"))
+}
 
 pub trait InputHandler {
     fn settings(&self) -> &Settings;
@@ -92,6 +116,25 @@ pub trait PointerMethods: InputHandler {
         let pointer_type = self.pointer_type();
         let cmd = format!("input type:{pointer_type} pointer_accel {new_val}");
         self.sway_connection().run_command(cmd)?;
+        Ok(())
+    }
+    fn apply_accel_profile(&mut self) -> Result<(), Box<dyn Error>> {
+        let has_key = self
+            .settings()
+            .settings_schema()
+            .map_or(false, |schema| schema.has_key("accel-profile"));
+        if !has_key {
+            return Ok(());
+        }
+        let profile: String = self.settings().get("accel-profile");
+        let pointer_type = self.pointer_type().to_string();
+        let mut set = ACCEL_PROFILE_SET.lock().unwrap();
+        let already_set = set.contains(&pointer_type);
+        if let Some(cmd) = accel_profile_command(&pointer_type, &profile, already_set) {
+            info!("{cmd}");
+            self.sway_connection().run_command(cmd)?;
+            set.insert(pointer_type);
+        }
         Ok(())
     }
     fn apply_natural_scroll(&mut self) -> Result<(), Box<dyn Error>> {
