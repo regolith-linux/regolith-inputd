@@ -32,10 +32,16 @@ const CUSTOM_KEYBINDINGS_KEY: &str = "custom-keybindings";
 ///   entry), which ends gnome-session as well. The `$` is escaped so that
 ///   sway expands the variable when the key is pressed, not when it is bound.
 ///
-/// Every other media-keys entry is deliberately left alone: the volume,
-/// playback, brightness and microphone keys are bound statically by the
-/// session, logind handles the power keys, and the rest have no sway
-/// equivalent.
+/// The other media-keys entries are not mirrored:
+///
+/// - Volume, microphone and playback can be rebound in Settings. Their XF86
+///   keys keep working through the session's static bindings, but a
+///   different key chosen in Settings is not bound.
+/// - Stop, eject, the media player, restart, power off, help, email, search
+///   and the accessibility keys can be rebound in Settings too, and have no
+///   binding here yet.
+/// - Brightness, the power keys (handled by logind), the touchpad and
+///   rotation keys and the `*-static` variants are not in Settings.
 const BUILTIN_SHORTCUTS: [(&str, &str); 7] = [
     ("terminal", "x-terminal-emulator"),
     ("home", "xdg-open $HOME"),
