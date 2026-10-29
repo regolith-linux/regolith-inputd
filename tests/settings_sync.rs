@@ -70,3 +70,34 @@ fn no_input_sources_configured() {
         Some("input type:touchpad tap enabled")
     );
 }
+
+/// GNOME's send-events values must reach sway in sway's spelling, which
+/// uses underscores ("disabled_on_external_mouse").
+#[test]
+fn touchpad_send_events_uses_sway_names() {
+    let (sway, daemon) = Daemon::start(
+        "send-events",
+        "[org/gnome/desktop/input-sources]\nsources=[('xkb', 'us')]\n",
+    );
+    sway.wait_for_startup();
+    for (value, expected) in [
+        (
+            "disabled-on-external-mouse",
+            "input type:touchpad events disabled_on_external_mouse",
+        ),
+        ("disabled", "input type:touchpad events disabled"),
+        ("enabled", "input type:touchpad events enabled"),
+    ] {
+        assert_eq!(
+            change(
+                &sway,
+                &daemon,
+                (TOUCHPAD, "send-events", value),
+                "input type:touchpad events"
+            )
+            .as_deref(),
+            Some(expected),
+            "send-events {value}"
+        );
+    }
+}

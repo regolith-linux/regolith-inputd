@@ -75,6 +75,8 @@ impl TouchpadHandler {
     }
     fn send_events(&mut self) -> Result<(), Box<dyn Error>> {
         let new_val: String = self.settings().get("send-events");
+        // GNOME spells it disabled-on-external-mouse, sway disabled_on_external_mouse.
+        let new_val = new_val.replace('-', "_");
         let cmd = format!("input type:touchpad events {new_val}");
         info!("{cmd}");
         self.sway_connection.run_command(cmd)?;
