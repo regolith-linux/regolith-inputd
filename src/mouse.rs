@@ -46,6 +46,7 @@ impl InputHandler for MouseHandler {
         info!("org.gnome.desktop.peripherals.mouse -> Key: {key} chaged");
         match key {
             "speed" => self.apply_speed()?,
+            "accel-profile" => self.apply_accel_profile()?,
             "natural-scroll" => self.apply_natural_scroll()?,
             "left-handed" => self.apply_left_handed()?,
             _ => (),
@@ -60,6 +61,7 @@ impl InputHandler for MouseHandler {
     }
     fn apply_all(&mut self) -> Result<(), Box<dyn Error>> {
         self.apply_speed()?;
+        self.apply_accel_profile()?;
         self.apply_left_handed()?;
         self.apply_natural_scroll()?;
         Ok(())
