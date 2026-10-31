@@ -17,6 +17,24 @@ impl MouseHandler {
             sway_connection,
         }
     }
+
+    /// Touchpads whose left-handed setting is "mouse" (GNOME's default)
+    /// follow the mouse, so a change to the mouse applies to them too.
+    fn apply_touchpad_left_handed(&mut self) -> Result<(), Box<dyn Error>> {
+        let touchpad_settings = Settings::new("org.gnome.desktop.peripherals.touchpad");
+        if touchpad_settings.get::<String>("left-handed") != "mouse" {
+            return Ok(());
+        }
+        let new_val: &str = self
+            .settings()
+            .get::<bool>("left-handed")
+            .to_sway_type()
+            .to_primitive();
+        let cmd = format!("input type:touchpad left_handed {new_val}");
+        info!("Executing command: {cmd}");
+        self.sway_connection().run_command(cmd)?;
+        Ok(())
+    }
 }
 
 impl PointerMethods for MouseHandler {
@@ -48,7 +66,10 @@ impl InputHandler for MouseHandler {
             "speed" => self.apply_speed()?,
             "accel-profile" => self.apply_accel_profile()?,
             "natural-scroll" => self.apply_natural_scroll()?,
-            "left-handed" => self.apply_left_handed()?,
+            "left-handed" => {
+                self.apply_left_handed()?;
+                self.apply_touchpad_left_handed()?;
+            }
             _ => (),
         };
         Ok(())
