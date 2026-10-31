@@ -41,7 +41,7 @@ pub struct FakeSway {
 }
 
 impl FakeSway {
-    fn start(socket: &Path) -> FakeSway {
+    fn start(socket: &Path, inputs: &'static str) -> FakeSway {
         let listener = UnixListener::bind(socket).unwrap();
         let commands = Arc::new(Mutex::new(Vec::new()));
         let subscribed = Arc::new(Mutex::new(false));
@@ -49,7 +49,7 @@ impl FakeSway {
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let (recorded, flag) = (recorded.clone(), flag.clone());
-                thread::spawn(move || serve(stream, recorded, flag));
+                thread::spawn(move || serve(stream, inputs, recorded, flag));
             }
         });
         FakeSway {
@@ -94,7 +94,12 @@ impl FakeSway {
     }
 }
 
-fn serve(mut stream: UnixStream, recorded: Arc<Mutex<Vec<String>>>, subscribed: Arc<Mutex<bool>>) {
+fn serve(
+    mut stream: UnixStream,
+    inputs: &str,
+    recorded: Arc<Mutex<Vec<String>>>,
+    subscribed: Arc<Mutex<bool>>,
+) {
     loop {
         let mut header = [0u8; 14];
         if stream.read_exact(&mut header).is_err() {
@@ -117,7 +122,7 @@ fn serve(mut stream: UnixStream, recorded: Arc<Mutex<Vec<String>>>, subscribed: 
                 *subscribed.lock().unwrap() = true;
                 r#"{"success": true}"#
             }
-            GET_INPUTS => INPUTS,
+            GET_INPUTS => inputs,
             _ => "[]",
         };
         let mut msg = Vec::from(&MAGIC[..]);
@@ -153,6 +158,15 @@ impl Daemon {
     /// Write `keyfile` as the user's GSettings and start the daemon on a
     /// fresh fake sway.
     pub fn start(name: &str, keyfile: &str) -> (FakeSway, Daemon) {
+        Daemon::start_with_inputs(name, keyfile, INPUTS)
+    }
+
+    /// Like `start`, with sway reporting `inputs` (GET_INPUTS JSON).
+    pub fn start_with_inputs(
+        name: &str,
+        keyfile: &str,
+        inputs: &'static str,
+    ) -> (FakeSway, Daemon) {
         let dir = std::env::temp_dir().join(format!("inputd-test-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let settings_dir = dir.join("config/glib-2.0/settings");
@@ -160,7 +174,7 @@ impl Daemon {
         fs::write(settings_dir.join("keyfile"), keyfile).unwrap();
 
         let socket = dir.join("sway.sock");
-        let sway = FakeSway::start(&socket);
+        let sway = FakeSway::start(&socket, inputs);
         let child = Command::new(env!("CARGO_BIN_EXE_regolith-inputd"))
             .env("SWAYSOCK", &socket)
             .env("GSETTINGS_BACKEND", "keyfile")
