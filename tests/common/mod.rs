@@ -17,6 +17,7 @@ const MAGIC: &[u8; 6] = b"i3-ipc";
 const RUN_COMMAND: u32 = 0;
 const SUBSCRIBE: u32 = 2;
 const GET_INPUTS: u32 = 100;
+const TICK_EVENT: u32 = 0x8000_0007;
 
 /// What sway reports for the attached devices: a keyboard, and a clickpad
 /// whose libinput default is software buttons in areas.
@@ -38,24 +39,38 @@ const INPUTS: &str = r#"[
 pub struct FakeSway {
     commands: Arc<Mutex<Vec<String>>>,
     subscribed: Arc<Mutex<bool>>,
+    events: Arc<Mutex<Option<UnixStream>>>,
 }
 
 impl FakeSway {
-    fn start(socket: &Path) -> FakeSway {
+    fn start(socket: &Path, inputs: &'static str) -> FakeSway {
         let listener = UnixListener::bind(socket).unwrap();
         let commands = Arc::new(Mutex::new(Vec::new()));
         let subscribed = Arc::new(Mutex::new(false));
-        let (recorded, flag) = (commands.clone(), subscribed.clone());
+        let events = Arc::new(Mutex::new(None));
+        let (recorded, flag, subscriber) = (commands.clone(), subscribed.clone(), events.clone());
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                let (recorded, flag) = (recorded.clone(), flag.clone());
-                thread::spawn(move || serve(stream, recorded, flag));
+                let (recorded, flag, subscriber) =
+                    (recorded.clone(), flag.clone(), subscriber.clone());
+                thread::spawn(move || serve(stream, inputs, recorded, flag, subscriber));
             }
         });
         FakeSway {
             commands,
             subscribed,
+            events,
         }
+    }
+
+    /// Send a tick event to the daemon, as `swaymsg -t send_tick` does. The
+    /// Regolith sway config sends `{"status": "reload_done"}` on every
+    /// config load.
+    pub fn send_tick(&self, payload: &str) {
+        let event = serde_json::json!({"first": false, "payload": payload}).to_string();
+        let mut stream = self.events.lock().unwrap();
+        let stream = stream.as_mut().expect("daemon has not subscribed");
+        stream.write_all(&message(TICK_EVENT, &event)).unwrap();
     }
 
     pub fn commands(&self) -> Vec<String> {
@@ -94,7 +109,13 @@ impl FakeSway {
     }
 }
 
-fn serve(mut stream: UnixStream, recorded: Arc<Mutex<Vec<String>>>, subscribed: Arc<Mutex<bool>>) {
+fn serve(
+    mut stream: UnixStream,
+    inputs: &str,
+    recorded: Arc<Mutex<Vec<String>>>,
+    subscribed: Arc<Mutex<bool>>,
+    subscriber: Arc<Mutex<Option<UnixStream>>>,
+) {
     loop {
         let mut header = [0u8; 14];
         if stream.read_exact(&mut header).is_err() {
@@ -114,20 +135,26 @@ fn serve(mut stream: UnixStream, recorded: Arc<Mutex<Vec<String>>>, subscribed: 
                 r#"[{"success": true}]"#
             }
             SUBSCRIBE => {
+                *subscriber.lock().unwrap() = stream.try_clone().ok();
                 *subscribed.lock().unwrap() = true;
                 r#"{"success": true}"#
             }
-            GET_INPUTS => INPUTS,
+            GET_INPUTS => inputs,
             _ => "[]",
         };
-        let mut msg = Vec::from(&MAGIC[..]);
-        msg.extend_from_slice(&(reply.len() as u32).to_ne_bytes());
-        msg.extend_from_slice(&kind.to_ne_bytes());
-        msg.extend_from_slice(reply.as_bytes());
-        if stream.write_all(&msg).is_err() {
+        if stream.write_all(&message(kind, reply)).is_err() {
             return;
         }
     }
+}
+
+/// An IPC message: a reply, or an event to a subscribed client.
+fn message(kind: u32, payload: &str) -> Vec<u8> {
+    let mut msg = Vec::from(&MAGIC[..]);
+    msg.extend_from_slice(&(payload.len() as u32).to_ne_bytes());
+    msg.extend_from_slice(&kind.to_ne_bytes());
+    msg.extend_from_slice(payload.as_bytes());
+    msg
 }
 
 /// The daemon process, killed when dropped.
@@ -153,6 +180,15 @@ impl Daemon {
     /// Write `keyfile` as the user's GSettings and start the daemon on a
     /// fresh fake sway.
     pub fn start(name: &str, keyfile: &str) -> (FakeSway, Daemon) {
+        Daemon::start_with_inputs(name, keyfile, INPUTS)
+    }
+
+    /// Like `start`, with sway reporting `inputs` (GET_INPUTS JSON).
+    pub fn start_with_inputs(
+        name: &str,
+        keyfile: &str,
+        inputs: &'static str,
+    ) -> (FakeSway, Daemon) {
         let dir = std::env::temp_dir().join(format!("inputd-test-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let settings_dir = dir.join("config/glib-2.0/settings");
@@ -160,7 +196,7 @@ impl Daemon {
         fs::write(settings_dir.join("keyfile"), keyfile).unwrap();
 
         let socket = dir.join("sway.sock");
-        let sway = FakeSway::start(&socket);
+        let sway = FakeSway::start(&socket, inputs);
         let child = Command::new(env!("CARGO_BIN_EXE_regolith-inputd"))
             .env("SWAYSOCK", &socket)
             .env("GSETTINGS_BACKEND", "keyfile")
