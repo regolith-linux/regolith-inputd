@@ -1,3 +1,4 @@
+mod a11y;
 mod cursor;
 mod input_sources;
 mod keyboard;
@@ -6,6 +7,7 @@ mod touchpad;
 mod traits;
 mod utils;
 
+use a11y::A11yKeyboardHandler;
 use cursor::CursorHandler;
 use input_sources::InputSourcesHandler;
 use keyboard::KeyboardHandler;
@@ -29,7 +31,7 @@ static mut ALLOW_GSETTINGS_APPLY: AtomicBool = AtomicBool::new(true);
 
 // Type Aliases
 type SharedRef<T> = Arc<Mutex<T>>;
-type HandlerList = SharedRef<[Box<dyn InputHandler + Send>; 5]>;
+type HandlerList = SharedRef<[Box<dyn InputHandler + Send>; 6]>;
 
 // Structs
 pub struct SettingsManager {
@@ -58,6 +60,7 @@ impl SettingsManager {
             Box::new(TouchpadHandler::new()),
             Box::new(InputSourcesHandler::new()),
             Box::new(CursorHandler::new()),
+            Box::new(A11yKeyboardHandler::new()),
         ]));
         SettingsManager { handlers }
     }
