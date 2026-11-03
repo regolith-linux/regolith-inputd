@@ -10,6 +10,7 @@ fn main() {
         error!("{e}");
         panic!();
     }
+    regolith_inputd::source_switching::start();
     app.hold();
     app.run();
 }

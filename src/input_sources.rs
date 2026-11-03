@@ -12,9 +12,10 @@ use swayipc::Connection as SwayConnection;
 /// gives an engine whose description has none.
 const DEFAULT_LAYOUT: &str = "us";
 
-/// A source of the effective source list: the XKB layout and variant it
-/// applies.
+/// A source of the effective source list: its identity in the `sources`
+/// setting and the XKB layout and variant it applies.
 pub struct EffectiveSource {
+    pub source: (String, String),
     pub layout: String,
     pub variant: String,
 }
@@ -38,7 +39,11 @@ pub fn effective_sources(sources: Vec<(String, String)>) -> Vec<EffectiveSource>
             },
             _ => continue,
         };
-        effective.push(EffectiveSource { layout, variant });
+        effective.push(EffectiveSource {
+            source: (kind, id),
+            layout,
+            variant,
+        });
     }
     effective
 }

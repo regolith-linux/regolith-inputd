@@ -2,6 +2,7 @@ mod cursor;
 mod input_sources;
 mod keyboard;
 mod mouse;
+pub mod source_switching;
 mod touchpad;
 mod traits;
 mod utils;
