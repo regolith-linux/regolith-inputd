@@ -1,0 +1,6 @@
+# regolith-inputd mirrors the GNOME keyboard shortcuts into sway. GNOME's
+# default lock shortcut, <Super>l, would then replace sway's $mod+l
+# ("focus right"). The X11 session clears it for the same reason
+# (regolith-default-settings, desktop "Regolith"); do the same here.
+[org.gnome.settings-daemon.plugins.media-keys:Regolith-Wayland]
+screensaver=['']
