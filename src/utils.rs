@@ -1,10 +1,13 @@
 use log::{error, info, warn};
-use std::io::{Read, Write};
+use std::env;
+use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::process::Command;
 use std::{error::Error, fmt::Display, thread, time::Duration};
 use swayipc::{
-    CommandType, Connection as SwayConnection, Error as SwayError, EventStream, EventType,
-    Fallible, Input, MAGIC,
+    CommandType, Connection as SwayConnection, Error as SwayError, Event, Fallible, Input, Success,
+    MAGIC,
 };
 
 use crate::HandlerList;
@@ -62,10 +65,71 @@ pub fn get_inputs() -> Fallible<Vec<Input>> {
         .collect())
 }
 
-pub fn get_new_inputevent_stream() -> Fallible<EventStream> {
-    let connection = SwayConnection::new()?;
-    let subs = [EventType::Input, EventType::Tick];
-    connection.subscribe(subs)
+/// An event from sway.
+pub enum SwayEvent {
+    /// An event swayipc decodes.
+    Event(Event),
+    /// An output was added, removed or reconfigured. swayipc 3 has no type
+    /// for these events.
+    Output,
+}
+
+/// The input, tick and output events sway sends.
+///
+/// swayipc 3 cannot subscribe to output events, so this subscribes over its
+/// own connection and hands every other event to swayipc's decoder. All
+/// three kinds are subscribed to in one request, so once sway has answered
+/// none of them can be missed.
+pub struct SwayEventStream(Option<UnixStream>);
+
+const EVENT_FLAG: u32 = 1 << 31;
+const OUTPUT_EVENT: u32 = EVENT_FLAG | 1;
+
+impl SwayEventStream {
+    pub fn subscribe() -> Fallible<SwayEventStream> {
+        let events = r#"["input","tick","output"]"#;
+        let mut stream = UnixStream::connect(sway_socket_path()?)?;
+        stream.write_all(&CommandType::Subscribe.encode_with(events))?;
+        let reply: Success = CommandType::Subscribe.decode(receive_message(&mut stream)?)?;
+        if !reply.success {
+            return Err(SwayError::SubscriptionFailed(events.to_string()));
+        }
+        Ok(SwayEventStream(Some(stream)))
+    }
+}
+
+impl Iterator for SwayEventStream {
+    type Item = Fallible<SwayEvent>;
+
+    /// Ends when the connection to sway is lost.
+    fn next(&mut self) -> Option<Self::Item> {
+        let stream = self.0.as_mut()?;
+        match receive_message(stream) {
+            Ok((OUTPUT_EVENT, _)) => Some(Ok(SwayEvent::Output)),
+            Ok(message) => Some(Event::decode(message).map(SwayEvent::Event)),
+            Err(e) => {
+                error!("Lost the connection to sway: {e}");
+                self.0 = None;
+                None
+            }
+        }
+    }
+}
+
+/// Finds sway's IPC socket the way swayipc does.
+fn sway_socket_path() -> io::Result<PathBuf> {
+    if let Some(path) = env::var_os("I3SOCK").or_else(|| env::var_os("SWAYSOCK")) {
+        return Ok(path.into());
+    }
+    let output = Command::new("sway").arg("--get-socketpath").output()?;
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "sway socket not found",
+        ));
+    }
+    Ok(path.into())
 }
 
 pub fn retry_action<F, T, E>(action: F, max_retry: usize, duration_before_retry: Duration) -> T
