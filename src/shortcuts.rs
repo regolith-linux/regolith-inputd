@@ -446,9 +446,6 @@ impl InputHandler for ShortcutsHandler {
     fn apply_all(&mut self) -> Result<(), Box<dyn Error>> {
         self.refresh(true)
     }
-    fn sync_gsettings(&mut self, _: &swayipc::Input) -> Result<(), Box<dyn Error>> {
-        Ok(())
-    }
 }
 
 unsafe impl Send for ShortcutsHandler {}

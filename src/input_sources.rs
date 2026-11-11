@@ -211,10 +211,6 @@ impl InputHandler for InputSourcesHandler {
     fn settings(&self) -> &Settings {
         &self.settings
     }
-    fn sync_gsettings(&mut self, input: &swayipc::Input) -> Result<(), Box<dyn Error>> {
-        info!("xkb_layout: {}", input.xkb_layout_names[0]);
-        Ok(())
-    }
     fn sway_connection(&mut self) -> &mut swayipc::Connection {
         &mut self.sway_connection
     }

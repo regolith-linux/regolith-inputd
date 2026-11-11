@@ -1,8 +1,11 @@
-use crate::traits::{InputHandler, PointerMethods, PrimitiveToSwayType, SwayTypeToPrimitive};
-use gio::{prelude::SettingsExtManual, traits::SettingsExt, Settings};
+use crate::traits::{
+    set_enabled_if_changed, InputHandler, PointerMethods, PrimitiveToSwayType, SwayTypeToPrimitive,
+};
+use gio::{prelude::SettingsExtManual, Settings};
 use log::info;
+use serde_json::Value;
 use std::error::Error;
-use swayipc::{Connection as SwayConnection, Input};
+use swayipc::Connection as SwayConnection;
 pub struct MouseHandler {
     settings: Settings,
     sway_connection: SwayConnection,
@@ -87,18 +90,14 @@ impl InputHandler for MouseHandler {
         self.apply_natural_scroll()?;
         Ok(())
     }
-    fn sync_gsettings(&mut self, input: &Input) -> Result<(), Box<dyn Error>> {
-        info!("Syncronizing mouse input state of sway with gsettings...");
-        self.sync_pointer_gsettings(input)?;
-        if input.libinput.is_none() {
-            return Ok(());
+    fn sway_input_type(&self) -> Option<&str> {
+        Some(self.pointer_type())
+    }
+    fn sync_gsettings(&self, setting: &str, value: &Value) -> Result<(), Box<dyn Error>> {
+        match setting {
+            "left_handed" => set_enabled_if_changed(self.settings(), "left-handed", value),
+            _ => self.sync_pointer_gsettings(setting, value),
         }
-        let libinput = input.libinput.as_ref().unwrap();
-        if let Some(left_handed) = libinput.left_handed.as_ref() {
-            self.settings()
-                .set_boolean("left-handed", left_handed.to_primitive())?;
-        }
-        Ok(())
     }
 }
 
