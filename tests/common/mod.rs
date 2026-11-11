@@ -397,6 +397,18 @@ impl Daemon {
         fs::write(dir.join(format!("{name}.xml")), xml).unwrap();
     }
 
+    /// Install an executable script at `path` (relative to the test's own
+    /// directory), as an input method package installs the command its
+    /// component file names; returns its absolute path.
+    pub fn install_script(&self, path: &str, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = self.dir.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
     /// Read a key the way `gsettings get` prints it.
     pub fn gsettings_get(&self, schema: &str, key: &str) -> String {
         let output = Command::new("gsettings")

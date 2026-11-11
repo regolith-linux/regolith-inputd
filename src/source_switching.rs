@@ -2,11 +2,14 @@
 //!
 //! One owner on the GLib main loop holds the switching state. sway's window,
 //! workspace, input and tick events and the input-sources settings changes
-//! reach it as messages through one channel and are processed in order.
+//! reach it as messages through one channel and are processed in order. A
+//! new engine list from IBus, which can change which sources count, reaches
+//! it on the same loop.
 //! Commands this module sends are fenced with a SEND_TICK: layout events seen
 //! before the fence's tick are the daemon's own and are never taken for a
 //! user's switch.
 
+use crate::ibus_engines;
 use crate::input_sources::effective_sources;
 use crate::utils;
 use gio::prelude::*;
@@ -293,6 +296,14 @@ impl Switcher {
         self.send_fence();
     }
 
+    /// IBus reported a new engine list: follow it when it changes which
+    /// sources count.
+    fn engine_list_changed(&mut self) {
+        if self.read_sources() != self.sources {
+            self.sources_changed();
+        }
+    }
+
     fn per_window_changed(&mut self) {
         self.per_window = self.settings.boolean("per-window");
         self.windows.clear();
@@ -445,6 +456,14 @@ pub fn start() {
         if key == "sources" || key == "per-window" {
             let _ = tx.send(Msg::Setting(key.to_string()));
         }
+    });
+
+    // Watch before the source list is first read, so that no engine list
+    // IBus reports after that read is missed.
+    let owner = sw.clone();
+    ibus_engines::watch().attach(None, move |()| {
+        owner.borrow_mut().engine_list_changed();
+        glib::Continue(true)
     });
 
     let owner = sw.clone();

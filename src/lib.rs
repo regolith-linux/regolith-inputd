@@ -1,13 +1,16 @@
 mod cursor;
+mod ibus_engines;
 mod input_method;
 mod input_sources;
 mod keyboard;
 mod mouse;
+mod shell;
 mod shortcuts;
 pub mod source_switching;
 mod touchpad;
 mod traits;
 mod utils;
+mod xml;
 
 use cursor::CursorHandler;
 use input_sources::InputSourcesHandler;
