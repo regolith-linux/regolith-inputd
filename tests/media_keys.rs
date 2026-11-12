@@ -51,7 +51,8 @@ fn media_and_system_keys_are_bound_at_startup() {
          next=['<Super><Shift>n']\n\
          reboot=['<Control><Alt>r']\n\
          shutdown=['<Control><Alt>End']\n\
-         email=['<Super>e']\n",
+         email=['<Super>e']\n\
+         eject=['<Super>j']\n",
     );
     sway.wait_for_startup();
     let commands = sway.commands();
@@ -75,6 +76,10 @@ fn media_and_system_keys_are_bound_at_startup() {
         (
             "email",
             "bindsym Mod4+e exec gtk-launch $(xdg-settings get default-url-scheme-handler mailto)",
+        ),
+        (
+            "eject",
+            "bindsym --locked Mod4+j exec regolith-sway-gsd-keys eject",
         ),
     ] {
         if !schema_has_key(key) {
@@ -123,6 +128,39 @@ fn rebinding_and_clearing_a_media_key_follow_settings() {
     );
 }
 
+/// Eject runs the session's eject helper, as the static XF86Eject binding in
+/// regolith-wm-config does, and follows Settings like the other keys.
+#[test]
+fn rebinding_and_clearing_eject_follow_settings() {
+    if !have_media_keys_schema() {
+        return;
+    }
+    let (sway, daemon) = Daemon::start(
+        "media-keys-eject",
+        "[org/gnome/settings-daemon/plugins/media-keys]\neject=['<Super>j']\n",
+    );
+    sway.wait_for_startup();
+    let commands = sway.commands();
+    assert!(
+        commands.contains(&"bindsym --locked Mod4+j exec regolith-sway-gsd-keys eject".to_string()),
+        "sway got {commands:?}"
+    );
+    let seen = sway.commands().len();
+    daemon.gsettings_set(MEDIA_KEYS, "eject", "['<Super><Shift>j']");
+    assert_eq!(
+        sway.wait_for(seen, "unbindsym").as_deref(),
+        Some("unbindsym --locked Mod4+j")
+    );
+    assert_eq!(
+        sway.wait_for(seen, "bindsym").as_deref(),
+        Some("bindsym --locked Mod4+Shift+j exec regolith-sway-gsd-keys eject")
+    );
+    assert_eq!(
+        change(&sway, &daemon, (MEDIA_KEYS, "eject", "['']"), "unbindsym").as_deref(),
+        Some("unbindsym --locked Mod4+Shift+j")
+    );
+}
+
 /// The schema's defaults bind only GNOME's Super+F1 for Help among the newly
 /// mirrored keys; the other Sound and Media and System keys are empty.
 #[test]
@@ -138,6 +176,7 @@ fn defaults_bind_only_help() {
         "playerctl",
         "sway.prompt.reboot",
         "sway.prompt.shutdown",
+        "regolith-sway-gsd-keys",
     ] {
         assert!(
             !commands.iter().any(|c| c.contains(unexpected)),
