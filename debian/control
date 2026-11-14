@@ -1,12 +1,12 @@
 Source: regolith-inputd
-Section: unknown
+Section: x11
 Priority: optional
 Maintainer: Soumya Ranjan Patnaik <soumyaranjan1812@gmail.com>
 Build-Depends: cargo, ca-certificates, libglib2.0-dev, debhelper-compat (=12),
  gsettings-desktop-schemas <!nocheck>, libglib2.0-bin <!nocheck>,
  gnome-settings-daemon-common <!nocheck>
 Standards-Version: 4.5.0
-Homepage: <https://github.com/regolith-linux/regolith-inputd>
+Homepage: https://github.com/regolith-linux/regolith-inputd
 
 Package: regolith-inputd
 Architecture: any
