@@ -18,8 +18,12 @@ const MAGIC: &[u8; 6] = b"i3-ipc";
 const RUN_COMMAND: u32 = 0;
 const SUBSCRIBE: u32 = 2;
 const GET_TREE: u32 = 4;
+const GET_CONFIG: u32 = 9;
 const SEND_TICK: u32 = 10;
+const GET_BINDING_STATE: u32 = 12;
 const GET_INPUTS: u32 = 100;
+const WORKSPACE_EVENT: u32 = 0x8000_0000;
+const MODE_EVENT: u32 = 0x8000_0002;
 const WINDOW_EVENT: u32 = 0x8000_0003;
 const TICK_EVENT: u32 = 0x8000_0007;
 const INPUT_EVENT: u32 = 0x8000_0015;
@@ -55,6 +59,10 @@ pub struct FakeSway {
 
 struct State {
     inputs: Value,
+    /// The text of the configuration file, as `get_config` reports it.
+    config: String,
+    /// The binding mode sway is in.
+    mode: String,
     /// Subscribed clients, with the events they subscribed to.
     subscribers: Vec<(UnixStream, Vec<String>)>,
     /// How many times a client asked for the tree.
@@ -128,12 +136,14 @@ impl State {
 }
 
 impl FakeSway {
-    fn start(socket: &Path, inputs: &'static str) -> FakeSway {
+    fn start(socket: &Path, inputs: &'static str, config: &str) -> FakeSway {
         let listener = UnixListener::bind(socket).unwrap();
         let commands = Arc::new(Mutex::new(Vec::new()));
         let subscribed = Arc::new(Mutex::new(false));
         let state = Arc::new(Mutex::new(State {
             inputs: serde_json::from_str(inputs).unwrap(),
+            config: config.to_string(),
+            mode: String::from("default"),
             subscribers: Vec::new(),
             tree_requests: 0,
         }));
@@ -159,6 +169,22 @@ impl FakeSway {
         let mut state = self.state.lock().unwrap();
         assert!(!state.subscribers.is_empty(), "daemon has not subscribed");
         state.emit(TICK_EVENT, "tick", &event);
+    }
+
+    /// Load the configuration again, as `swaymsg reload` does: sway drops the
+    /// bindings added at runtime and announces the reload.
+    pub fn reload(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.mode = String::from("default");
+        state.emit(WORKSPACE_EVENT, "workspace", r#"{"change": "reload"}"#);
+    }
+
+    /// Enter binding mode `mode`, as a binding with `mode <name>` does.
+    pub fn enter_mode(&self, mode: &str) {
+        let mut state = self.state.lock().unwrap();
+        state.mode = mode.to_string();
+        let event = json!({"change": mode, "pango_markup": false}).to_string();
+        state.emit(MODE_EVENT, "mode", &event);
     }
 
     /// Switch the keyboards' layout the way the user's key binding does:
@@ -298,7 +324,9 @@ fn serve(
             RUN_COMMAND => {
                 recorded.lock().unwrap().push(payload.clone());
                 state.run(&payload);
-                r#"[{"success": true}]"#.to_string()
+                // One outcome for each command of the list.
+                let outcomes = vec![json!({"success": true}); command_count(&payload)];
+                Value::from(outcomes).to_string()
             }
             SUBSCRIBE => {
                 let events: Vec<String> = serde_json::from_str(&payload).unwrap();
@@ -318,12 +346,33 @@ fn serve(
                 "[]".to_string()
             }
             GET_INPUTS => state.inputs.to_string(),
+            GET_CONFIG => json!({ "config": state.config }).to_string(),
+            GET_BINDING_STATE => json!({ "name": state.mode }).to_string(),
             _ => "[]".to_string(),
         };
         if stream.write_all(&message(kind, &reply)).is_err() {
             return;
         }
     }
+}
+
+/// How many commands a command list holds: they are separated by `;` or
+/// `,` outside quotes.
+fn command_count(list: &str) -> usize {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut count = 1;
+    for c in list.chars() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '"' | '\'' if quote == Some(c) => quote = None,
+            '"' | '\'' if quote.is_none() => quote = Some(c),
+            ';' | ',' if quote.is_none() => count += 1,
+            _ => {}
+        }
+    }
+    count
 }
 
 /// An IPC message: a reply, or an event to a subscribed client.
@@ -367,6 +416,17 @@ impl Daemon {
         keyfile: &str,
         inputs: &'static str,
     ) -> (FakeSway, Daemon) {
+        Daemon::start_with_config(name, keyfile, inputs, "")
+    }
+
+    /// Like `start_with_inputs`, with sway reporting `config` as the text
+    /// of its configuration file.
+    pub fn start_with_config(
+        name: &str,
+        keyfile: &str,
+        inputs: &'static str,
+        config: &str,
+    ) -> (FakeSway, Daemon) {
         let dir = std::env::temp_dir().join(format!("inputd-test-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let settings_dir = dir.join("config/glib-2.0/settings");
@@ -374,7 +434,7 @@ impl Daemon {
         fs::write(settings_dir.join("keyfile"), keyfile).unwrap();
 
         let socket = dir.join("sway.sock");
-        let sway = FakeSway::start(&socket, inputs);
+        let sway = FakeSway::start(&socket, inputs, config);
         let child = Command::new(env!("CARGO_BIN_EXE_regolith-inputd"))
             // Without a Wayland display the daemon starts no input method, so
             // tests run from a desktop session leave its IBus alone.

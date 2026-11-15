@@ -13,4 +13,4 @@ Restart=on-failure
 
 
 [Install]
-WantedBy=regolith-wayland.target
+WantedBy=regolith-wayland.target regolith-x11.target

@@ -2,6 +2,7 @@ mod cursor;
 mod input_method;
 mod input_sources;
 mod keyboard;
+pub mod layout_bindings;
 mod mouse;
 mod shortcuts;
 pub mod source_switching;
