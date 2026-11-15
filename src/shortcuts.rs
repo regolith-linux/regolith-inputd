@@ -65,16 +65,19 @@ const fn locked(key: &'static str, command: &'static str) -> Builtin {
 ///   `$wm.media.volume.step` when the binding is added.
 /// - `media` starts the default music player, `help` the default help viewer
 ///   and `email` the default mail client, as gnome-settings-daemon does.
+/// - `eject` runs the session's own eject helper, `regolith-sway-gsd-keys`
+///   from regolith-wm-config, which ejects the drive gnome-settings-daemon
+///   would pick; like the session's XF86Eject binding, it is `--locked`.
 ///
 /// The other media-keys entries are not mirrored:
 ///
-/// - Eject, search and the accessibility keys can be rebound in Settings,
-///   but do nothing in the sway session yet (search does nothing in the X11
-///   session either: it opens the GNOME Shell search).
+/// - Search and the accessibility keys can be rebound in Settings, but do
+///   nothing in the sway session yet (search does nothing in the X11 session
+///   either: it opens the GNOME Shell search).
 /// - Brightness, the power keys (handled by logind), the touchpad and
 ///   rotation keys and the `*-static` variants are not in Settings. The
 ///   session binds the XF86 media keys statically.
-const BUILTIN_SHORTCUTS: [Builtin; 21] = [
+const BUILTIN_SHORTCUTS: [Builtin; 22] = [
     builtin("terminal", "x-terminal-emulator"),
     builtin("home", "xdg-open $HOME"),
     builtin("www", "gtk-launch $(xdg-settings get default-web-browser)"),
@@ -93,6 +96,7 @@ const BUILTIN_SHORTCUTS: [Builtin; 21] = [
     locked("stop", "playerctl stop"),
     locked("previous", "playerctl previous"),
     locked("next", "playerctl next"),
+    locked("eject", "regolith-sway-gsd-keys eject"),
     builtin(
         "media",
         "gtk-launch $(xdg-mime query default audio/x-vorbis+ogg)",
