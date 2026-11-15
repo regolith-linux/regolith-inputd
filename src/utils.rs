@@ -1,30 +1,14 @@
-use log::{error, info, warn};
+use log::{error, warn};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::{error::Error, fmt::Display, thread, time::Duration};
+use std::{fmt::Display, thread, time::Duration};
 use swayipc::{
-    CommandType, Connection as SwayConnection, Error as SwayError, EventStream, EventType,
-    Fallible, Input, MAGIC,
+    CommandType, Connection as SwayConnection, Error as SwayError, Fallible, Input, Success, MAGIC,
 };
 
-use crate::HandlerList;
-
-pub fn sync_input_gsettings<'a>(
-    handlers_sref: &'a mut HandlerList,
-    input: &Input,
-) -> Result<(), Box<dyn Error + 'a>> {
-    let input_type = input.input_type.clone();
-    let handler_index = match input_type.as_ref() {
-        "pointer" => 0,
-        "keyboard" => 1,
-        "touchpad" => 2,
-        _ => return Err("Incompatible input type".into()),
-    };
-    info!("Recieved Sway InputEvent for {}", input.input_type);
-    let mut handlers_lock = handlers_sref.lock()?;
-    handlers_lock[handler_index].sync_gsettings_sync(input)?;
-    Ok(())
-}
+const WORKSPACE_EVENT: u32 = 0x8000_0000;
+const TICK_EVENT: u32 = 0x8000_0007;
+const INPUT_EVENT: u32 = 0x8000_0015;
 
 /// Read one whole sway IPC message: its type and its payload. The payload is
 /// read in full before it is decoded, so one that doesn't decode never
@@ -62,10 +46,51 @@ pub fn get_inputs() -> Fallible<Vec<Input>> {
         .collect())
 }
 
-pub fn get_new_inputevent_stream() -> Fallible<EventStream> {
-    let connection = SwayConnection::new()?;
-    let subs = [EventType::Input, EventType::Tick];
-    connection.subscribe(subs)
+/// An event from sway, as far as the daemon cares.
+pub enum SwayEvent {
+    /// An input device was configured. What the event reports isn't kept:
+    /// by the time it is read it may be out of date.
+    Input,
+    /// An input device was added or removed.
+    Hotplug,
+    /// A tick sent with `swaymsg -t send_tick`, with its payload.
+    Tick(String),
+    /// sway loaded its configuration again.
+    WorkspaceReload,
+    Other,
+}
+
+/// sway's input, tick and workspace events. Subscribed to over a
+/// connection of its own, so that input events swayipc's `Input` can't
+/// decode (devices without vendor or product ids) still get through.
+pub fn subscribe_to_events() -> Fallible<impl Iterator<Item = Fallible<SwayEvent>>> {
+    let events = r#"["input", "tick", "workspace"]"#;
+    let mut stream: UnixStream = SwayConnection::new()?.into();
+    stream.write_all(&CommandType::Subscribe.encode_with(events))?;
+    let reply: Success = CommandType::Subscribe.decode(receive_message(&mut stream)?)?;
+    if !reply.success {
+        return Err(SwayError::SubscriptionFailed(events.to_string()));
+    }
+    Ok(std::iter::from_fn(move || {
+        Some(receive_message(&mut stream).map(|(kind, payload)| decode_event(kind, &payload)))
+    }))
+}
+
+fn decode_event(kind: u32, payload: &[u8]) -> SwayEvent {
+    let payload: serde_json::Value = serde_json::from_slice(payload).unwrap_or_default();
+    match kind {
+        INPUT_EVENT if payload["change"] == "added" || payload["change"] == "removed" => {
+            SwayEvent::Hotplug
+        }
+        INPUT_EVENT => SwayEvent::Input,
+        // The tick sent to every new subscriber is no reload.
+        TICK_EVENT if payload["first"] == false => match payload["payload"].as_str() {
+            Some(tick) => SwayEvent::Tick(tick.to_string()),
+            None => SwayEvent::Other,
+        },
+        WORKSPACE_EVENT if payload["change"] == "reload" => SwayEvent::WorkspaceReload,
+        _ => SwayEvent::Other,
+    }
 }
 
 pub fn retry_action<F, T, E>(action: F, max_retry: usize, duration_before_retry: Duration) -> T

@@ -7,8 +7,9 @@ use common::{Daemon, FakeSway};
 
 const SOURCES: &str = "org.gnome.desktop.input-sources";
 
-/// The commands sway gets after the first `skip`, from the first
-/// `xkb_variant` or `xkb_layout` command on, at most `n` of them.
+/// The first `n` `xkb_variant` and `xkb_layout` commands sway gets after
+/// the first `skip`. The `xkb_switch_layout` commands of source switching
+/// can come in between; they are left out.
 fn layout_commands(sway: &FakeSway, skip: usize, n: usize) -> Vec<String> {
     sway.wait_for(skip, "input type:keyboard xkb_variant");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -17,9 +18,9 @@ fn layout_commands(sway: &FakeSway, skip: usize, n: usize) -> Vec<String> {
             .commands()
             .into_iter()
             .skip(skip)
-            .skip_while(|c| {
-                !c.starts_with("input type:keyboard xkb_variant")
-                    && !c.starts_with("input type:keyboard xkb_layout")
+            .filter(|c| {
+                c.starts_with("input type:keyboard xkb_variant")
+                    || c.starts_with("input type:keyboard xkb_layout")
             })
             .take(n)
             .collect();

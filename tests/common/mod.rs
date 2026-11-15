@@ -6,10 +6,10 @@
 
 use serde_json::{json, Value};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -20,6 +20,7 @@ const SUBSCRIBE: u32 = 2;
 const GET_TREE: u32 = 4;
 const SEND_TICK: u32 = 10;
 const GET_INPUTS: u32 = 100;
+const WORKSPACE_EVENT: u32 = 0x8000_0000;
 const WINDOW_EVENT: u32 = 0x8000_0003;
 const TICK_EVENT: u32 = 0x8000_0007;
 const INPUT_EVENT: u32 = 0x8000_0015;
@@ -42,7 +43,11 @@ const INPUTS: &str = r#"[
 
 /// A minimal sway IPC server that records every command it is asked to run.
 ///
-/// It keeps the keyboards' layouts as sway does: `xkb_layout`,
+/// It keeps the devices' libinput settings as sway does: `input` commands
+/// change them, and each device a command changes is reported to the
+/// subscribed clients in a "libinput_config" input event.
+///
+/// It also keeps the keyboards' layouts as sway does: `xkb_layout`,
 /// `xkb_variant` and `xkb_options` commands compile a new keymap, which
 /// starts on the first layout, and `xkb_switch_layout` switches layouts.
 /// Each change is sent to the subscribed clients as an input event, and
@@ -61,6 +66,26 @@ struct State {
     tree_requests: usize,
 }
 
+/// The libinput setting, as GET_INPUTS names it, that a sway `input`
+/// subcommand sets.
+fn libinput_setting(subcommand: &str) -> Option<&'static str> {
+    Some(match subcommand {
+        "pointer_accel" => "accel_speed",
+        "accel_profile" => "accel_profile",
+        "natural_scroll" => "natural_scroll",
+        "left_handed" => "left_handed",
+        "tap" => "tap",
+        "drag" => "tap_drag",
+        "drag_lock" => "tap_drag_lock",
+        "dwt" => "dwt",
+        "middle_emulation" => "middle_emulation",
+        "events" => "send_events",
+        "scroll_method" => "scroll_method",
+        "click_method" => "click_method",
+        _ => return None,
+    })
+}
+
 impl State {
     /// Send an event to the clients subscribed to `name`.
     fn emit(&mut self, kind: u32, name: &str, payload: &str) {
@@ -76,6 +101,50 @@ impl State {
             .unwrap()
             .iter_mut()
             .filter(|i| i["type"] == "keyboard")
+    }
+
+    fn input_event(&mut self, change: &str, input: &Value) {
+        let event = json!({"change": change, "input": input}).to_string();
+        self.emit(INPUT_EVENT, "input", &event);
+    }
+
+    /// Run the libinput part of an `input` command, as sway does: set the
+    /// setting on every matching device that has it, and report the devices
+    /// it changed. Like sway, a device lists only the settings it supports.
+    fn run_libinput(&mut self, cmd: &str) {
+        let Some(rest) = cmd.strip_prefix("input ") else {
+            return;
+        };
+        let Some((target, rest)) = rest.rsplit_once(' ').and_then(|(head, value)| {
+            let (target, subcommand) = head.rsplit_once(' ')?;
+            Some((target, (subcommand, value)))
+        }) else {
+            return;
+        };
+        let (subcommand, value) = rest;
+        let Some(setting) = libinput_setting(subcommand) else {
+            return;
+        };
+        let value = match setting {
+            // sway keeps the speed as a float.
+            "accel_speed" => json!(value.parse::<f32>().unwrap() as f64),
+            _ => json!(value),
+        };
+        let mut changed = Vec::new();
+        for input in self.inputs.as_array_mut().unwrap() {
+            let matches = match target.strip_prefix("type:") {
+                Some(input_type) => input["type"] == input_type,
+                None => input["identifier"] == target.trim_matches('"'),
+            };
+            let libinput = &mut input["libinput"];
+            if matches && libinput.get(setting).is_some() && libinput[setting] != value {
+                libinput[setting] = value.clone();
+                changed.push(input.clone());
+            }
+        }
+        for input in changed {
+            self.input_event("libinput_config", &input);
+        }
     }
 
     /// Put every keyboard with more than `index` layouts on `index`.
@@ -97,6 +166,7 @@ impl State {
 
     /// Run the keyboard part of a sway command.
     fn run(&mut self, cmd: &str) {
+        self.run_libinput(cmd);
         let Some(arg) = cmd.strip_prefix("input type:keyboard ") else {
             return;
         };
@@ -159,6 +229,54 @@ impl FakeSway {
         let mut state = self.state.lock().unwrap();
         assert!(!state.subscribers.is_empty(), "daemon has not subscribed");
         state.emit(TICK_EVENT, "tick", &event);
+    }
+
+    /// Send the workspace "reload" event sway sends once it has loaded its
+    /// configuration again.
+    pub fn send_workspace_reload(&self) {
+        let event = json!({"change": "reload", "current": null, "old": null}).to_string();
+        let mut state = self.state.lock().unwrap();
+        state.emit(WORKSPACE_EVENT, "workspace", &event);
+    }
+
+    /// Run an `input` command the way the user does with swaymsg, or the
+    /// way a reload resets a device: in sway, not from the daemon.
+    pub fn user_command(&self, cmd: &str) {
+        self.state.lock().unwrap().run(cmd);
+    }
+
+    /// Send an input event about `input`, as sway does for a device that is
+    /// added or removed (`change` "added", "removed") or was configured
+    /// ("libinput_config"). The devices sway reports don't change.
+    pub fn send_input_event(&self, change: &str, input: Value) {
+        self.state.lock().unwrap().input_event(change, &input);
+    }
+
+    /// Plug in a device, as GET_INPUTS reports it.
+    pub fn add_device(&self, input: Value) {
+        let mut state = self.state.lock().unwrap();
+        state.inputs.as_array_mut().unwrap().push(input.clone());
+        state.input_event("added", &input);
+    }
+
+    /// Unplug the device `identifier`.
+    pub fn remove_device(&self, identifier: &str) {
+        let mut state = self.state.lock().unwrap();
+        let inputs = state.inputs.as_array_mut().unwrap();
+        let index = inputs
+            .iter()
+            .position(|i| i["identifier"] == identifier)
+            .unwrap();
+        let input = inputs.remove(index);
+        state.input_event("removed", &input);
+    }
+
+    /// The libinput `setting` of device `identifier`, as sway reports it.
+    pub fn libinput(&self, identifier: &str, setting: &str) -> Value {
+        let state = self.state.lock().unwrap();
+        let inputs = state.inputs.as_array().unwrap();
+        let input = inputs.iter().find(|i| i["identifier"] == identifier);
+        input.unwrap()["libinput"][setting].clone()
     }
 
     /// Switch the keyboards' layout the way the user's key binding does:
@@ -419,6 +537,61 @@ impl Daemon {
             .status()
             .unwrap();
         assert!(status.success(), "gsettings set {schema} {key} {value}");
+    }
+}
+
+impl Daemon {
+    /// Wait up to five seconds for `key` to read `value`; returns what it
+    /// read last.
+    pub fn wait_for_gsetting(&self, schema: &str, key: &str, value: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let current = self.gsettings_get(schema, key);
+            if current == value || Instant::now() >= deadline {
+                return current;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Record every change to `schema` from now on, whoever makes it.
+    pub fn monitor(&self, schema: &str) -> GSettingsMonitor {
+        let mut child = Command::new("gsettings")
+            .args(["monitor", schema])
+            .env("GSETTINGS_BACKEND", "keyfile")
+            .env("XDG_CONFIG_HOME", self.dir.join("config"))
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let changes = Arc::new(Mutex::new(Vec::new()));
+        let (stdout, recorded) = (child.stdout.take().unwrap(), changes.clone());
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                recorded.lock().unwrap().push(line);
+            }
+        });
+        // gsettings monitor reports nothing until it watches the keyfile.
+        thread::sleep(Duration::from_millis(300));
+        GSettingsMonitor { child, changes }
+    }
+}
+
+/// The changes `gsettings monitor` reported, one line per change.
+pub struct GSettingsMonitor {
+    child: Child,
+    changes: Arc<Mutex<Vec<String>>>,
+}
+
+impl GSettingsMonitor {
+    pub fn changes(&self) -> Vec<String> {
+        self.changes.lock().unwrap().clone()
+    }
+}
+
+impl Drop for GSettingsMonitor {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 

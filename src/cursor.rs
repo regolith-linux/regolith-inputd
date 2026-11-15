@@ -2,7 +2,7 @@ use crate::InputHandler;
 use gio::{prelude::SettingsExtManual, Settings};
 use log::info;
 use std::error::Error;
-use swayipc::{Connection as SwayConnection, Input};
+use swayipc::Connection as SwayConnection;
 
 /// Mirrors GNOME's cursor theme and size to sway's seats.
 pub struct CursorHandler {
@@ -56,9 +56,6 @@ impl InputHandler for CursorHandler {
     }
     fn apply_all(&mut self) -> Result<(), Box<dyn Error>> {
         self.apply_cursor_theme()
-    }
-    fn sync_gsettings(&mut self, _: &Input) -> Result<(), Box<dyn Error>> {
-        Ok(())
     }
 }
 

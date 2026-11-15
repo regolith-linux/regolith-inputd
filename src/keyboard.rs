@@ -55,9 +55,6 @@ impl InputHandler for KeyboardHandler {
         self.apply_repeat_delay()?;
         Ok(())
     }
-    fn sync_gsettings(&mut self, _: &swayipc::Input) -> Result<(), Box<dyn Error>> {
-        Ok(())
-    }
 }
 unsafe impl Send for KeyboardHandler {}
 

@@ -1,15 +1,15 @@
 use gio::prelude::SettingsExtManual;
 use gio::{traits::SettingsExt, Settings};
-use log::{error, info};
+use glib::{FromVariant, ToVariant};
+use log::info;
+use serde_json::Value;
 use std::collections::BTreeSet;
 use std::error::Error;
+use std::sync::mpsc::Sender;
 use std::sync::Mutex;
-use std::sync::atomic::Ordering;
-use std::thread;
-use std::time::Duration;
-use swayipc::{ClickMethod, Connection as SwayConnection, EnabledOrDisabled, Input, SendEvents};
+use swayipc::{ClickMethod, Connection as SwayConnection, EnabledOrDisabled, SendEvents};
 
-use crate::{ALLOW_GSETTINGS_APPLY, ALLOW_SWAYINPUT_APPLY};
+use crate::Message;
 
 /// Pointer types whose acceleration profile the daemon has set.
 static ACCEL_PROFILE_SET: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
@@ -33,77 +33,57 @@ pub fn accel_profile_command(
     Some(format!("input type:{pointer_type} accel_profile {profile}"))
 }
 
+/// Set `key` to `value` unless it has that value already, so that
+/// mirroring sway to GSettings only writes what differs.
+pub fn set_if_changed<T>(settings: &Settings, key: &str, value: T) -> Result<(), Box<dyn Error>>
+where
+    T: ToVariant + FromVariant + PartialEq,
+{
+    if settings.get::<T>(key) != value {
+        info!("Mirroring sway's {key} {} to gsettings", value.to_variant());
+        settings.set(key, &value)?;
+    }
+    Ok(())
+}
+
+/// Set boolean `key` from a libinput setting sway reports as "enabled" or
+/// "disabled".
+pub fn set_enabled_if_changed(
+    settings: &Settings,
+    key: &str,
+    value: &Value,
+) -> Result<(), Box<dyn Error>> {
+    match value.as_str() {
+        Some("enabled") => set_if_changed(settings, key, true),
+        Some("disabled") => set_if_changed(settings, key, false),
+        _ => Ok(()),
+    }
+}
+
 pub trait InputHandler {
     fn settings(&self) -> &Settings;
     fn sway_connection(&mut self) -> &mut SwayConnection;
     fn apply_changes(&mut self, _: &str) -> Result<(), Box<dyn Error>>;
     fn apply_all(&mut self) -> Result<(), Box<dyn Error>>;
-    fn sync_gsettings(&mut self, _: &Input) -> Result<(), Box<dyn Error>>;
 
-    fn apply_changes_sync(&mut self, key: &str) -> Result<(), Box<dyn Error>> {
-        unsafe {
-            ALLOW_SWAYINPUT_APPLY.store(false, Ordering::Relaxed);
-        }
-        let result = self.apply_changes(key);
-
-        thread::sleep(Duration::from_millis(100));
-
-        unsafe {
-            let allow = ALLOW_SWAYINPUT_APPLY.load(Ordering::Relaxed) && true;
-            ALLOW_SWAYINPUT_APPLY.store(allow, Ordering::Relaxed);
-        }
-        result
+    /// The type of the sway input devices whose settings this handler
+    /// mirrors back to GSettings, if any.
+    fn sway_input_type(&self) -> Option<&str> {
+        None
     }
 
-    fn apply_all_sync(&mut self) -> Result<(), Box<dyn Error>> {
-        unsafe {
-            if !ALLOW_GSETTINGS_APPLY.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-            ALLOW_SWAYINPUT_APPLY.store(false, Ordering::Relaxed);
-        }
-
-        let result = self.apply_all();
-
-        thread::sleep(Duration::from_millis(100));
-
-        unsafe {
-            let allow = ALLOW_SWAYINPUT_APPLY.load(Ordering::Relaxed) && true;
-            ALLOW_SWAYINPUT_APPLY.store(allow, Ordering::Relaxed);
-        }
-        result
+    /// Mirror a libinput setting (named as in sway's GET_INPUTS reply) that
+    /// all devices of `sway_input_type` now have to GSettings.
+    fn sync_gsettings(&self, _setting: &str, _value: &Value) -> Result<(), Box<dyn Error>> {
+        Ok(())
     }
 
-    fn sync_gsettings_sync(&mut self, _: &Input) -> Result<(), Box<dyn Error>> {
-        unsafe {
-            if !ALLOW_SWAYINPUT_APPLY.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-            ALLOW_GSETTINGS_APPLY.store(false, Ordering::Relaxed);
-        }
-
-        let result = self.apply_all();
-
-        thread::sleep(Duration::from_millis(100));
-
-        unsafe {
-            let allow = ALLOW_GSETTINGS_APPLY.load(Ordering::Relaxed) && true;
-            ALLOW_GSETTINGS_APPLY.store(allow, Ordering::Relaxed);
-        }
-        result
-    }
-
-    fn monitor_gsettings_change(&mut self)
-    where
-        Self: 'static,
-    {
-        let ptr: *mut Self = self;
-        self.settings().connect_changed(None, move |_, key| unsafe {
-            if !ptr.is_null() {
-                if let Err(e) = (*ptr).apply_changes_sync(key) {
-                    error!("{e}");
-                };
-            }
+    /// Tell the owner of the handlers, as handler `index`, about every
+    /// change to this handler's schema.
+    fn monitor_gsettings_change(&self, index: usize, sender: Sender<Message>) {
+        self.settings().connect_changed(None, move |_, key| {
+            // The owner is gone only when the daemon is stopping.
+            let _ = sender.send(Message::GSettingsChanged(index, key.to_string()));
         });
     }
 }
@@ -148,24 +128,29 @@ pub trait PointerMethods: InputHandler {
         self.sway_connection().run_command(cmd)?;
         Ok(())
     }
-    fn sync_pointer_gsettings(&self, input: &Input) -> Result<(), Box<dyn Error>> {
-        if input.libinput.is_none() {
-            return Ok(());
+    /// Mirror the settings mice and touchpads share to GSettings.
+    fn sync_pointer_gsettings(&self, setting: &str, value: &Value) -> Result<(), Box<dyn Error>> {
+        match (setting, value.as_f64()) {
+            ("accel_speed", Some(speed)) => {
+                set_if_changed(self.settings(), "speed", gsettings_speed(speed))
+            }
+            ("natural_scroll", _) => {
+                set_enabled_if_changed(self.settings(), "natural-scroll", value)
+            }
+            _ => Ok(()),
         }
-        let libinput = input.libinput.as_ref().unwrap();
-        if let Some(speed) = libinput.accel_speed {
-            self.settings().set_double("speed", speed)?;
-        }
-        if let Some(natural) = libinput.natural_scroll.as_ref() {
-            self.settings()
-                .set_boolean("natural-scroll", natural.to_primitive())?;
-        }
-        if let Some(accel) = libinput.accel_speed {
-            self.settings().set_double("speed", accel)?;
-        }
-        Ok(())
     }
     fn apply_click_method(&mut self) -> Result<(), Box<dyn Error>>;
+}
+
+/// GSettings' `speed` for the acceleration speed sway reports. sway keeps
+/// the speed as a float, so a speed set as 0.1 comes back as
+/// 0.10000000149011612; it is mirrored as 0.1.
+fn gsettings_speed(sway_speed: f64) -> f64 {
+    (sway_speed as f32)
+        .to_string()
+        .parse()
+        .unwrap_or(sway_speed)
 }
 
 pub trait SwayTypeToPrimitive<T> {
@@ -226,5 +211,60 @@ impl SwayTypeToPrimitive<&str> for ClickMethod {
             ClickMethod::Clickfinger => "clickfinger",
             _ => "none",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    #[test]
+    fn speeds_are_mirrored_at_the_precision_sway_keeps() {
+        assert_eq!(gsettings_speed(0.1_f32 as f64), 0.1);
+        assert_eq!(gsettings_speed(-0.5), -0.5);
+        assert_eq!(gsettings_speed(0.7_f32 as f64), 0.7);
+    }
+
+    /// Mirroring writes a key only when its value differs, so sway's state
+    /// never causes a redundant GSettings write.
+    #[test]
+    fn only_values_that_differ_are_written() {
+        const MOUSE: &str = "org.gnome.desktop.peripherals.mouse";
+        let installed = gio::SettingsSchemaSource::default()
+            .and_then(|source| source.lookup(MOUSE, true))
+            .is_some();
+        if !installed {
+            eprintln!("{MOUSE} is not installed, skipping");
+            return;
+        }
+        let context = glib::MainContext::new();
+        context
+            .with_thread_default(|| {
+                let settings = Settings::with_backend(MOUSE, &gio::memory_settings_backend_new());
+                let writes = Rc::new(Cell::new(0));
+                let counter = writes.clone();
+                settings.connect_changed(None, move |_, _| counter.set(counter.get() + 1));
+                let written = || {
+                    while context.iteration(false) {}
+                    writes.get()
+                };
+                // natural-scroll and speed start at false and 0.
+                set_enabled_if_changed(&settings, "natural-scroll", &json!("disabled")).unwrap();
+                assert_eq!(written(), 0);
+                set_enabled_if_changed(&settings, "natural-scroll", &json!("enabled")).unwrap();
+                assert_eq!(written(), 1);
+                set_enabled_if_changed(&settings, "natural-scroll", &json!("enabled")).unwrap();
+                set_enabled_if_changed(&settings, "natural-scroll", &json!(null)).unwrap();
+                set_if_changed(&settings, "speed", 0.0).unwrap();
+                assert_eq!(written(), 1);
+                set_if_changed(&settings, "speed", 0.25).unwrap();
+                assert_eq!(written(), 2);
+                assert!(settings.boolean("natural-scroll"));
+                assert_eq!(settings.double("speed"), 0.25);
+            })
+            .unwrap();
     }
 }
