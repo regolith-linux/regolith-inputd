@@ -6,11 +6,20 @@
 //! Commands this module sends are fenced with a SEND_TICK: layout events seen
 //! before the fence's tick are the daemon's own and are never taken for a
 //! user's switch.
+//!
+//! The owner also answers the input-source service (see
+//! [`crate::sources_service`]): its method calls join the same queue, and
+//! after each message it announces a change of the listed sources or of the
+//! current source, and keeps the `current` key on the current source's
+//! position in the list. Others' writes to `current` are not followed.
 
-use crate::input_sources::effective_sources;
+use crate::input_sources::{effective_sources, EffectiveSource};
+use crate::sources_service::{self, Call, Entry};
 use crate::utils;
+use crate::xkb_rules::XkbRules;
 use gio::prelude::*;
-use gio::Settings;
+use gio::{BusType, DBusConnection, DBusMethodInvocation, Settings};
+use glib::thread_guard::ThreadGuard;
 use glib::ToVariant;
 use log::{debug, info, warn};
 use serde::Deserialize;
@@ -19,6 +28,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::rc::Rc;
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 use swayipc::{
@@ -32,6 +42,12 @@ const FENCE: &str = "regolith-inputd:sources:";
 const INPUT_EVENT: u32 = 21;
 
 type Source = (String, String);
+
+/// One entry of the source list: a source and which of its occurrences in
+/// the list it is, counting from zero. A source listed once is always its
+/// occurrence 0, so repeated sources stay distinct entries while list edits
+/// keep following each source.
+type Slot = (Source, usize);
 
 /// An input device as sway describes it. Decoded leniently: keyboards
 /// without vendor/product ids (virtual keyboards, the wlroots X11/Wayland
@@ -56,6 +72,9 @@ enum Msg {
     Sway(Event),
     Input(DeviceEvent),
     Setting(String),
+    /// A call of the input-source service. It is answered on the thread
+    /// that received it, which also runs the owner.
+    Call(Call, ThreadGuard<DBusMethodInvocation>),
 }
 
 struct Keyboard {
@@ -66,17 +85,27 @@ struct Keyboard {
 struct Switcher {
     settings: Settings,
     conn: Option<Connection>,
+    /// The effective source list, with each source's position in `sources`.
+    listed: Vec<EffectiveSource>,
+    /// Their identities.
     sources: Vec<Source>,
-    /// Listed sources that were chosen or made current, most recent first.
+    /// Listed entries that were chosen or made current, most recent first.
     /// The never-chosen ones are not in it.
-    recent: Vec<Source>,
-    current: Option<Source>,
+    recent: Vec<Slot>,
+    current: Option<Slot>,
     per_window: bool,
-    windows: HashMap<i64, Source>,
+    windows: HashMap<i64, Slot>,
     focused: Option<i64>,
     keyboards: HashMap<String, Keyboard>,
     fence_sent: u64,
     fence_seen: u64,
+    rules: XkbRules,
+    bus: Option<DBusConnection>,
+    /// What the service last announced: the entries and the current one.
+    published: (Vec<Entry>, Option<usize>),
+    /// The current entry's position in `sources` and its source, as last
+    /// announced. `current` is stored when either changes.
+    published_current: Option<(u32, Source)>,
 }
 
 fn is_view(n: &Node) -> bool {
@@ -106,10 +135,15 @@ fn has_views(n: &Node) -> bool {
 impl Switcher {
     fn new() -> Switcher {
         let settings = Settings::new("org.gnome.desktop.input-sources");
+        // The keys written for one message (`mru-sources`, `current`) are
+        // applied together after it: a reader never sees one without the
+        // other, and with a file backend no write lands between them.
+        settings.delay();
         let conn = Connection::new().ok();
         Switcher {
             settings,
             conn,
+            listed: Vec::new(),
             sources: Vec::new(),
             recent: Vec::new(),
             current: None,
@@ -119,55 +153,97 @@ impl Switcher {
             keyboards: HashMap::new(),
             fence_sent: 0,
             fence_seen: 0,
+            rules: XkbRules::load(),
+            bus: None,
+            published: (Vec::new(), None),
+            published_current: None,
         }
     }
 
-    /// The effective source list: what layout index i of sway's layouts is.
-    fn read_sources(&self) -> Vec<Source> {
-        effective_sources(self.settings.get::<Vec<Source>>("sources"))
-            .into_iter()
-            .map(|e| e.source)
-            .collect()
+    /// Read the effective source list: what layout index i of sway's
+    /// layouts is.
+    fn read_sources(&mut self) {
+        self.listed = effective_sources(self.settings.get::<Vec<Source>>("sources"));
+        self.sources = self.listed.iter().map(|e| e.source.clone()).collect();
     }
 
-    fn index_of(&self, s: &Source) -> Option<usize> {
-        self.sources.iter().position(|x| x == s)
+    /// The entry at layout index `i`.
+    fn slot_at(&self, i: usize) -> Slot {
+        let s = self.sources[i].clone();
+        let n = self.sources[..i].iter().filter(|x| **x == s).count();
+        (s, n)
     }
 
-    /// Keep only the listed sources of `history`, once each, in order.
-    fn set_recent(&mut self, history: Vec<Source>) {
-        let mut recent: Vec<Source> = Vec::new();
-        for s in history {
-            if self.sources.contains(&s) && !recent.contains(&s) {
-                recent.push(s);
+    /// The layout index of an entry: its occurrence of the source, or the
+    /// source's first occurrence when the list no longer repeats it that
+    /// often.
+    fn index_of(&self, (s, n): &Slot) -> Option<usize> {
+        let mut found = self
+            .sources
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| *x == s)
+            .map(|(i, _)| i);
+        let first = found.next()?;
+        Some(if *n == 0 {
+            first
+        } else {
+            found.nth(n - 1).unwrap_or(first)
+        })
+    }
+
+    fn current_index(&self) -> Option<usize> {
+        self.current.as_ref().and_then(|c| self.index_of(c))
+    }
+
+    /// Keep only the listed entries of `history`, once each, in order.
+    fn set_recent(&mut self, history: Vec<Slot>) {
+        let mut seen: Vec<usize> = Vec::new();
+        for i in history.iter().filter_map(|s| self.index_of(s)) {
+            if !seen.contains(&i) {
+                seen.push(i);
             }
         }
-        self.recent = recent;
+        self.recent = seen.into_iter().map(|i| self.slot_at(i)).collect();
     }
 
-    /// The value `mru-sources` gets: every listed source, the most recently
+    /// The entries a stored `mru-sources` value names: a source's first
+    /// appearance there is its first occurrence, the next one its second,
+    /// and so on.
+    fn slots_of(history: Vec<Source>) -> Vec<Slot> {
+        let mut slots: Vec<Slot> = Vec::new();
+        for s in history {
+            let n = slots.iter().filter(|(x, _)| *x == s).count();
+            slots.push((s, n));
+        }
+        slots
+    }
+
+    /// The value `mru-sources` gets: every listed entry, the most recently
     /// chosen first, then the never-chosen ones in list order.
     fn history(&self) -> Vec<Source> {
         let mut h = self.recent.clone();
         h.extend(
-            self.sources
-                .iter()
-                .filter(|s| !self.recent.contains(s))
-                .cloned(),
+            (0..self.sources.len())
+                .map(|i| self.slot_at(i))
+                .filter(|s| !self.recent.contains(s)),
         );
-        h
+        h.into_iter().map(|(s, _)| s).collect()
     }
 
     fn startup(&mut self) {
-        self.sources = self.read_sources();
+        self.read_sources();
         self.per_window = self.settings.boolean("per-window");
         let saved: Vec<Source> = self.settings.get::<Vec<Source>>("mru-sources");
-        self.set_recent(saved);
+        self.set_recent(Self::slots_of(saved));
         self.refresh_keyboards();
         self.focused = self.query_focused();
-        let first = self.recent.first().or(self.sources.first()).cloned();
+        let first = match self.recent.first() {
+            Some(s) => self.index_of(s),
+            None => (!self.sources.is_empty()).then_some(0),
+        };
         if let Some(first) = first {
-            info!("Starting on input source {first:?}");
+            info!("Starting on input source {:?}", self.sources[first]);
             self.activate(first, false);
         }
     }
@@ -242,10 +318,12 @@ impl Switcher {
         self.send_fence();
     }
 
-    fn activate(&mut self, s: Source, interactive: bool) {
-        let Some(index) = self.index_of(&s) else {
+    /// Make the entry at layout index `index` the current one.
+    fn activate(&mut self, index: usize, interactive: bool) {
+        if index >= self.sources.len() {
             return;
-        };
+        }
+        let s = self.slot_at(index);
         self.current = Some(s.clone());
         self.recent.retain(|x| x != &s);
         self.recent.insert(0, s.clone());
@@ -263,29 +341,33 @@ impl Switcher {
         self.switch_all(index);
     }
 
-    fn window_source(&self, id: i64) -> Option<Source> {
-        match self.windows.get(&id) {
-            Some(s) if self.sources.contains(s) => Some(s.clone()),
-            _ => self.sources.first().cloned(),
+    /// The layout index of the entry a window had, or the first entry.
+    fn window_source(&self, id: i64) -> Option<usize> {
+        match self.windows.get(&id).and_then(|s| self.index_of(s)) {
+            Some(i) => Some(i),
+            None => (!self.sources.is_empty()).then_some(0),
         }
     }
 
     fn reassert(&mut self) {
-        if let Some(i) = self.current.as_ref().and_then(|c| self.index_of(c)) {
+        if let Some(i) = self.current_index() {
             self.switch_all(i);
         }
     }
 
     fn sources_changed(&mut self) {
-        self.sources = self.read_sources();
+        self.read_sources();
         let history = std::mem::take(&mut self.recent);
         self.set_recent(history);
-        let keep = self.current.clone().filter(|c| self.sources.contains(c));
-        let fallback = || self.recent.first().or(self.sources.first()).cloned();
+        let keep = self.current_index();
+        let fallback = || match self.recent.first() {
+            Some(s) => self.index_of(s),
+            None => (!self.sources.is_empty()).then_some(0),
+        };
         match keep.or_else(fallback) {
-            Some(s) => {
+            Some(i) => {
                 self.current = None;
-                self.activate(s, false);
+                self.activate(i, false);
             }
             None => self.current = None,
         }
@@ -298,14 +380,77 @@ impl Switcher {
         self.windows.clear();
     }
 
+    /// Announce a change of the listed entries or of the current source.
+    /// When the current entry's position or its source changes, `current`
+    /// follows it.
+    fn publish(&mut self) {
+        let current = self.current_index();
+        let active = current.map(|i| (self.listed[i].position, self.sources[i].clone()));
+        if active != self.published_current {
+            if let Some((position, _)) = &active {
+                self.store_position(*position);
+            }
+            self.published_current = active;
+        }
+        let view = (sources_service::entries(&self.listed, &self.rules), current);
+        if view != self.published {
+            self.published = view;
+            if let Some(bus) = self.bus.as_ref() {
+                sources_service::emit_changed(bus);
+            }
+        }
+    }
+
+    /// Store the current source's position in `current`, unless it is there.
+    fn store_position(&self, position: u32) {
+        if self.settings.uint("current") == position {
+            return;
+        }
+        debug!("current = {position}");
+        if let Err(e) = self.settings.set_uint("current", position) {
+            warn!("{e}");
+        }
+    }
+
+    /// Answer a call of the service. An activation that switched is
+    /// returned, to be answered once the settings it changed are stored.
+    fn on_call(
+        &mut self,
+        call: Call,
+        invocation: DBusMethodInvocation,
+    ) -> Option<DBusMethodInvocation> {
+        match call {
+            Call::GetInputSources => {
+                let (entries, current) = &self.published;
+                let reply = sources_service::input_sources_reply(entries, *current);
+                invocation.return_value(Some(&reply));
+            }
+            Call::Activate(position) => {
+                let Some(i) = self.listed.iter().position(|e| e.position == position) else {
+                    sources_service::refuse_index(invocation, position);
+                    return None;
+                };
+                if self.current_index() == Some(i) {
+                    invocation.return_value(None);
+                    return None;
+                }
+                info!("Activating {:?} at {position}", self.sources[i]);
+                self.activate(i, true);
+                return Some(invocation);
+            }
+            Call::ActivateProperty => sources_service::refuse_property(invocation),
+        }
+        None
+    }
+
     fn on_event(&mut self, ev: Event) {
         match ev {
             Event::Window(w) => match w.change {
                 WindowChange::Focus => {
                     self.focused = Some(w.container.id);
                     if self.per_window {
-                        if let Some(s) = self.window_source(w.container.id) {
-                            self.activate(s, false);
+                        if let Some(i) = self.window_source(w.container.id) {
+                            self.activate(i, false);
                         }
                     }
                 }
@@ -361,11 +506,11 @@ impl Switcher {
                 if self.fenced() || layouts != self.sources.len() {
                     return;
                 }
-                let cur = self.current.as_ref().and_then(|c| self.index_of(c));
-                if cur != Some(index as usize) {
-                    if let Some(s) = self.sources.get(index as usize).cloned() {
-                        info!("User switched to {s:?}");
-                        self.activate(s, true);
+                let index = index as usize;
+                if self.current_index() != Some(index) {
+                    if let Some(s) = self.sources.get(index) {
+                        info!("User switched to {s:?} at layout {index}");
+                        self.activate(index, true);
                     }
                 }
             }
@@ -439,6 +584,22 @@ pub fn start() {
         }
     });
 
+    // The input-source service's method calls join the queue as well.
+    match gio::bus_get_sync(BusType::Session, gio::Cancellable::NONE) {
+        Ok(bus) => {
+            let call_tx = Mutex::new(tx.clone());
+            let exported = sources_service::export(&bus, move |call, invocation| {
+                let msg = Msg::Call(call, ThreadGuard::new(invocation));
+                let _ = call_tx.lock().map(|tx| tx.send(msg));
+            });
+            match exported {
+                Ok(()) => sw.borrow_mut().bus = Some(bus),
+                Err(e) => warn!("Input-source service not published: {e}"),
+            }
+        }
+        Err(e) => warn!("No session bus, input-source service not published: {e}"),
+    }
+
     // Settings changes join the same queue. The owner's own mru-sources write
     // emits "changed" too; only the keys it follows are queued.
     sw.borrow().settings.connect_changed(None, move |_, key| {
@@ -450,13 +611,25 @@ pub fn start() {
     let owner = sw.clone();
     rx.attach(None, move |msg| {
         let mut s = owner.borrow_mut();
+        let mut activated = None;
         match msg {
             Msg::Sway(ev) => s.on_event(ev),
             Msg::Input(ev) => s.on_input(ev),
             Msg::Setting(key) if key == "sources" => s.sources_changed(),
             Msg::Setting(_) => s.per_window_changed(),
+            Msg::Call(call, invocation) => activated = s.on_call(call, invocation.into_inner()),
+        }
+        s.publish();
+        s.settings.apply();
+        if let Some(invocation) = activated {
+            // The caller finds the new source stored when the call returns.
+            Settings::sync();
+            invocation.return_value(None);
         }
         glib::Continue(true)
     });
-    sw.borrow_mut().startup();
+    let mut s = sw.borrow_mut();
+    s.startup();
+    s.publish();
+    s.settings.apply();
 }

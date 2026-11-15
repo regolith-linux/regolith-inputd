@@ -5,9 +5,11 @@ mod keyboard;
 mod mouse;
 mod shortcuts;
 pub mod source_switching;
+mod sources_service;
 mod touchpad;
 mod traits;
 mod utils;
+mod xkb_rules;
 
 use cursor::CursorHandler;
 use input_sources::InputSourcesHandler;

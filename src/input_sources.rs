@@ -14,11 +14,12 @@ use swayipc::Connection as SwayConnection;
 const DEFAULT_LAYOUT: &str = "us";
 
 /// A source of the effective source list: its identity in the `sources`
-/// setting, the XKB layout and variant it applies, and for an IBus source
-/// its engine.
+/// setting and its position there, the XKB layout and variant it applies,
+/// and for an IBus source its engine.
 #[derive(Clone)]
 pub struct EffectiveSource {
     pub source: (String, String),
+    pub position: u32,
     pub layout: String,
     pub variant: String,
     pub engine: Option<String>,
@@ -31,7 +32,7 @@ pub struct EffectiveSource {
 pub fn effective_sources(sources: Vec<(String, String)>) -> Vec<EffectiveSource> {
     let mut engines: Option<HashMap<String, (String, String)>> = None;
     let mut effective = Vec::new();
-    for (kind, id) in sources {
+    for (position, (kind, id)) in (0..).zip(sources) {
         let ((layout, variant), engine) = match kind.as_str() {
             "xkb" => match id.split_once('+') {
                 Some((layout, variant)) => ((layout.to_string(), variant.to_string()), None),
@@ -45,6 +46,7 @@ pub fn effective_sources(sources: Vec<(String, String)>) -> Vec<EffectiveSource>
         };
         effective.push(EffectiveSource {
             source: (kind, id),
+            position,
             layout,
             variant,
             engine,
@@ -80,15 +82,7 @@ pub(crate) fn ibus_engines() -> HashMap<String, (String, String)> {
 
 /// The `<engine>` elements of an IBus component description.
 fn parse_engines(xml: &str) -> Vec<(String, (String, String))> {
-    let mut text = String::new();
-    let mut rest = xml;
-    while let Some(start) = rest.find("<!--") {
-        text.push_str(&rest[..start]);
-        rest = rest[start..]
-            .find("-->")
-            .map_or("", |end| &rest[start + end + 3..]);
-    }
-    text.push_str(rest);
+    let text = strip_comments(xml);
     let mut engines = Vec::new();
     for block in text.split("<engine>").skip(1) {
         let block = block.split("</engine>").next().unwrap_or_default();
@@ -104,8 +98,22 @@ fn parse_engines(xml: &str) -> Vec<(String, (String, String))> {
     engines
 }
 
+/// `xml` without its comments.
+pub(crate) fn strip_comments(xml: &str) -> String {
+    let mut text = String::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find("<!--") {
+        text.push_str(&rest[..start]);
+        rest = rest[start..]
+            .find("-->")
+            .map_or("", |end| &rest[start + end + 3..]);
+    }
+    text.push_str(rest);
+    text
+}
+
 /// The text of the first `<tag>` element in `xml`, unescaped.
-fn element(xml: &str, tag: &str) -> Option<String> {
+pub(crate) fn element(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = xml.find(&open)? + open.len();
@@ -232,13 +240,17 @@ mod tests {
             ("other".into(), "de".into()),
             ("xkb".into(), "de+nodeadkeys".into()),
         ];
-        let effective: Vec<(String, String)> = effective_sources(sources)
+        let effective: Vec<(u32, String, String)> = effective_sources(sources)
             .into_iter()
-            .map(|e| (e.layout, e.variant))
+            .map(|e| (e.position, e.layout, e.variant))
             .collect();
+        // Each keeps its position in the list.
         assert_eq!(
             effective,
-            vec![("us".into(), "".into()), ("de".into(), "nodeadkeys".into())]
+            vec![
+                (0, "us".into(), "".into()),
+                (2, "de".into(), "nodeadkeys".into())
+            ]
         );
     }
 

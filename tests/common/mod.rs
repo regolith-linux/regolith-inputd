@@ -6,10 +6,10 @@
 
 use serde_json::{json, Value};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -367,11 +367,44 @@ impl Daemon {
         keyfile: &str,
         inputs: &'static str,
     ) -> (FakeSway, Daemon) {
+        Daemon::spawn(name, keyfile, inputs, None, None)
+    }
+
+    /// Like `start_with_inputs`, with the daemon on the session bus `bus`
+    /// and `xkb_rules` as the system's XKB rules description (evdev.xml).
+    pub fn start_on_bus(
+        name: &str,
+        keyfile: &str,
+        inputs: &'static str,
+        bus: &SessionBus,
+        xkb_rules: &str,
+    ) -> (FakeSway, Daemon) {
+        Daemon::spawn(name, keyfile, inputs, Some(bus), Some(xkb_rules))
+    }
+
+    fn spawn(
+        name: &str,
+        keyfile: &str,
+        inputs: &'static str,
+        bus: Option<&SessionBus>,
+        xkb_rules: Option<&str>,
+    ) -> (FakeSway, Daemon) {
         let dir = std::env::temp_dir().join(format!("inputd-test-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let settings_dir = dir.join("config/glib-2.0/settings");
         fs::create_dir_all(&settings_dir).unwrap();
         fs::write(settings_dir.join("keyfile"), keyfile).unwrap();
+        let rules_dir = dir.join("xkb/rules");
+        fs::create_dir_all(&rules_dir).unwrap();
+        if let Some(xml) = xkb_rules {
+            fs::write(rules_dir.join("evdev.xml"), xml).unwrap();
+        }
+        // Without a bus of their own, daemons get one that doesn't exist, so
+        // tests run from a desktop session leave its bus names alone.
+        let bus_address = bus.map_or_else(
+            || format!("unix:path={}", dir.join("no-bus").display()),
+            |b| b.address.clone(),
+        );
 
         let socket = dir.join("sway.sock");
         let sway = FakeSway::start(&socket, inputs);
@@ -380,6 +413,9 @@ impl Daemon {
             // tests run from a desktop session leave its IBus alone.
             .env_remove("WAYLAND_DISPLAY")
             .env("SWAYSOCK", &socket)
+            .env("DBUS_SESSION_BUS_ADDRESS", bus_address)
+            .env("HOME", &dir)
+            .env("XKB_CONFIG_ROOT", dir.join("xkb"))
             .env("GSETTINGS_BACKEND", "keyfile")
             .env("XDG_CONFIG_HOME", dir.join("config"))
             .env("IBUS_COMPONENT_PATH", dir.join("ibus"))
@@ -419,6 +455,38 @@ impl Daemon {
             .status()
             .unwrap();
         assert!(status.success(), "gsettings set {schema} {key} {value}");
+    }
+}
+
+/// A private D-Bus session bus, stopped when dropped.
+pub struct SessionBus {
+    child: Child,
+    pub address: String,
+}
+
+impl SessionBus {
+    pub fn start() -> SessionBus {
+        let mut child = Command::new("dbus-daemon")
+            .args(["--session", "--nofork", "--nopidfile", "--print-address=1"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("dbus-daemon runs");
+        let mut address = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut address)
+            .unwrap();
+        assert!(!address.trim().is_empty(), "dbus-daemon printed no address");
+        SessionBus {
+            child,
+            address: address.trim().to_string(),
+        }
+    }
+}
+
+impl Drop for SessionBus {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
