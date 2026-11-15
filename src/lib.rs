@@ -1,3 +1,4 @@
+mod a11y;
 mod cursor;
 mod input_method;
 mod input_sources;
@@ -9,6 +10,7 @@ mod touchpad;
 mod traits;
 mod utils;
 
+use a11y::A11yKeyboardHandler;
 use cursor::CursorHandler;
 use input_sources::InputSourcesHandler;
 use keyboard::KeyboardHandler;
@@ -62,6 +64,7 @@ impl SettingsManager {
             Box::new(TouchpadHandler::new()),
             Box::new(InputSourcesHandler::new()),
             Box::new(CursorHandler::new()),
+            Box::new(A11yKeyboardHandler::new()),
         ];
         match ShortcutsHandler::new() {
             Some(shortcuts) => handlers.push(Box::new(shortcuts)),
