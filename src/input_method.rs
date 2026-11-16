@@ -29,7 +29,8 @@
 //! selects a different one.
 //!
 //! The integration is experimental and off unless the trawl resource
-//! `regolith.experimental.ibus` is `true`, read once as the daemon starts.
+//! `regolith.experimental.ibus` is `true`, read from trawld once as the
+//! daemon starts.
 //! IBus 1.5.32 to 1.5.34, the releases Debian trixie and recent Ubuntu ship,
 //! stop committing text in Wayland programs once a monitor is connected or
 //! disconnected (<https://github.com/ibus/ibus/issues/2870>, fixed in
@@ -38,7 +39,9 @@
 
 use crate::input_sources::{ibus_engines, EffectiveSource};
 use crate::utils;
-use gio::{Cancellable, DBusCallFlags, DBusConnection, DBusConnectionFlags, DBusSignalFlags};
+use gio::{
+    BusType, Cancellable, DBusCallFlags, DBusConnection, DBusConnectionFlags, DBusSignalFlags,
+};
 use glib::ToVariant;
 use log::{info, warn};
 use serde_json::Value;
@@ -473,18 +476,32 @@ impl Supervisor {
     }
 }
 
-/// Whether the session's trawl resources turn the input method on. Without
-/// `trawlcat`, or without a running trawld, it stays off.
+/// Whether the session's trawl resources turn the input method on. trawld
+/// answers an unset resource with an empty value; without a reachable
+/// trawld the input method stays off.
 fn enabled_by_resource() -> bool {
-    Command::new("trawlcat")
-        .arg(ENABLE_RESOURCE)
-        .arg("false")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .is_ok_and(|output| {
-            output.status.success() && is_true(&String::from_utf8_lossy(&output.stdout))
-        })
+    let reply = gio::bus_get_sync(BusType::Session, Cancellable::NONE).and_then(|bus| {
+        bus.call_sync(
+            Some("org.regolith.Trawl"),
+            "/org/regolith/Trawl",
+            "org.regolith.trawl1",
+            "GetResource",
+            Some(&(ENABLE_RESOURCE,).to_variant()),
+            None,
+            DBusCallFlags::NONE,
+            5000,
+            Cancellable::NONE,
+        )
+    });
+    match reply {
+        Ok(reply) => reply
+            .get::<(String,)>()
+            .is_some_and(|(value,)| is_true(&value)),
+        Err(e) => {
+            info!("Cannot read {ENABLE_RESOURCE} from trawld: {e}");
+            false
+        }
+    }
 }
 
 /// Whether a resource value reads as true.
