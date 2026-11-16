@@ -7,7 +7,8 @@
 //! which since GTK 4.20 leave dead keys and compose sequences to the input
 //! method, lose accents even on plain layouts.
 //!
-//! So whenever IBus is installed the daemon keeps it running:
+//! So when IBus is installed and the session opts in (see below), the daemon
+//! keeps it running:
 //! - `ibus-daemon`, with `ibus-ui-gtk3 --enable-wayland-im` as its panel,
 //!   which serves Wayland programs through sway's input method protocol;
 //! - `ibus-x11`, which serves X11 programs on `DISPLAY` through XIM. It runs
@@ -26,10 +27,21 @@
 //! engines of all counted sources are preloaded, and the engine of the source
 //! in use is selected again when another IBus client (the panel as it starts)
 //! selects a different one.
+//!
+//! The integration is experimental and off unless the trawl resource
+//! `regolith.experimental.ibus` is `true`, read from trawld once as the
+//! daemon starts.
+//! IBus 1.5.32 to 1.5.34, the releases Debian trixie and recent Ubuntu ship,
+//! stop committing text in Wayland programs once a monitor is connected or
+//! disconnected (<https://github.com/ibus/ibus/issues/2870>, fixed in
+//! 1.5.35). An IBus the user starts themselves is not affected by the
+//! setting.
 
 use crate::input_sources::{ibus_engines, EffectiveSource};
 use crate::utils;
-use gio::{Cancellable, DBusCallFlags, DBusConnection, DBusConnectionFlags, DBusSignalFlags};
+use gio::{
+    BusType, Cancellable, DBusCallFlags, DBusConnection, DBusConnectionFlags, DBusSignalFlags,
+};
 use glib::ToVariant;
 use log::{info, warn};
 use serde_json::Value;
@@ -49,6 +61,8 @@ use swayipc::{CommandType, Connection as SwayConnection, Error as SwayError, Fal
 /// The XKB engine GNOME selects for xkb sources. Used when no installed XKB
 /// engine matches a layout, and when no source is usable.
 const DEFAULT_ENGINE: &str = "xkb:us::eng";
+/// The trawl resource that turns the input method on.
+const ENABLE_RESOURCE: &str = "regolith.experimental.ibus";
 /// How often the input method's processes are checked.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// The shortest time between two starts of the same program. For
@@ -104,10 +118,15 @@ impl Shared {
 }
 
 impl InputMethod {
-    /// Start keeping the input method running, in a Wayland session.
+    /// Start keeping the input method running, in a Wayland session that
+    /// opts in through `ENABLE_RESOURCE`.
     pub fn start() -> InputMethod {
         if env::var_os("WAYLAND_DISPLAY").is_none() {
             info!("WAYLAND_DISPLAY is not set, no input method is started");
+            return InputMethod { shared: None };
+        }
+        if !enabled_by_resource() {
+            info!("{ENABLE_RESOURCE} is not true, no input method is started");
             return InputMethod { shared: None };
         }
         let shared = Arc::new(Shared::default());
@@ -457,6 +476,39 @@ impl Supervisor {
     }
 }
 
+/// Whether the session's trawl resources turn the input method on. trawld
+/// answers an unset resource with an empty value; without a reachable
+/// trawld the input method stays off.
+fn enabled_by_resource() -> bool {
+    let reply = gio::bus_get_sync(BusType::Session, Cancellable::NONE).and_then(|bus| {
+        bus.call_sync(
+            Some("org.regolith.Trawl"),
+            "/org/regolith/Trawl",
+            "org.regolith.trawl1",
+            "GetResource",
+            Some(&(ENABLE_RESOURCE,).to_variant()),
+            None,
+            DBusCallFlags::NONE,
+            5000,
+            Cancellable::NONE,
+        )
+    });
+    match reply {
+        Ok(reply) => reply
+            .get::<(String,)>()
+            .is_some_and(|(value,)| is_true(&value)),
+        Err(e) => {
+            info!("Cannot read {ENABLE_RESOURCE} from trawld: {e}");
+            false
+        }
+    }
+}
+
+/// Whether a resource value reads as true.
+fn is_true(value: &str) -> bool {
+    value.trim().eq_ignore_ascii_case("true")
+}
+
 /// Connect to the `ibus-daemon` serving the session, if one is running.
 fn connect(programs: &Programs) -> Option<DBusConnection> {
     let output = Command::new(&programs.tool)
@@ -632,9 +684,18 @@ fn follow_input_events(shared: &Shared) -> Fallible<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{active_layout, xkb_engine, DEFAULT_ENGINE};
+    use super::{active_layout, is_true, xkb_engine, DEFAULT_ENGINE};
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn only_a_true_resource_turns_the_input_method_on() {
+        assert!(is_true("true"));
+        assert!(is_true("True\n"));
+        assert!(!is_true("false"));
+        assert!(!is_true(""));
+        assert!(!is_true("1"));
+    }
 
     #[test]
     fn xkb_sources_select_the_xkb_engine_of_their_layout() {
