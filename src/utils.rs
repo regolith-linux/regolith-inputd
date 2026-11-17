@@ -1,13 +1,19 @@
 use log::{error, info, warn};
+use serde::Deserialize;
+use serde_json::Value;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::{error::Error, fmt::Display, thread, time::Duration};
 use swayipc::{
-    CommandType, Connection as SwayConnection, Error as SwayError, EventStream, EventType,
-    Fallible, Input, MAGIC,
+    CommandType, Connection as SwayConnection, Error as SwayError, EventType, Fallible, Input,
+    TickEvent, MAGIC,
 };
 
 use crate::HandlerList;
+
+const OUTPUT_EVENT: u32 = 0x8000_0001;
+const TICK_EVENT: u32 = 0x8000_0007;
+const INPUT_EVENT: u32 = 0x8000_0015;
 
 pub fn sync_input_gsettings<'a>(
     handlers_sref: &'a mut HandlerList,
@@ -54,6 +60,14 @@ pub fn get_inputs_json() -> Fallible<Vec<serde_json::Value>> {
     CommandType::GetInputs.decode(receive_message(&mut stream)?)
 }
 
+/// sway's outputs, untyped, disabled ones included. swayipc's `Output`
+/// requires fields sway leaves out for some outputs.
+pub fn get_outputs_json() -> Fallible<Vec<serde_json::Value>> {
+    let mut stream: UnixStream = SwayConnection::new()?.into();
+    stream.write_all(&CommandType::GetOutputs.encode())?;
+    CommandType::GetOutputs.decode(receive_message(&mut stream)?)
+}
+
 /// The input devices swayipc's `Input` can describe; the others are left out.
 pub fn get_inputs() -> Fallible<Vec<Input>> {
     Ok(get_inputs_json()?
@@ -62,10 +76,98 @@ pub fn get_inputs() -> Fallible<Vec<Input>> {
         .collect())
 }
 
-pub fn get_new_inputevent_stream() -> Fallible<EventStream> {
-    let connection = SwayConnection::new()?;
-    let subs = [EventType::Input, EventType::Tick];
-    connection.subscribe(subs)
+/// A string field of a GET_INPUTS or GET_OUTPUTS object, or "".
+pub fn str_field<'a>(object: &'a Value, field: &str) -> &'a str {
+    object[field].as_str().unwrap_or_default()
+}
+
+/// Whether a GET_INPUTS device is a trackball: a pointer whose name says so,
+/// whatever its capitalisation, as GNOME tells trackballs from mice.
+pub fn is_trackball(device: &Value) -> bool {
+    str_field(device, "type") == "pointer"
+        && str_field(device, "name")
+            .to_lowercase()
+            .contains("trackball")
+}
+
+/// Whether sway reports `setting` among a device's libinput settings. sway
+/// lists only those the device supports.
+pub fn offers(device: &Value, setting: &str) -> bool {
+    device["libinput"].get(setting).is_some()
+}
+
+/// Run `commands` as one command list, so no other client's command can come
+/// between them. A command sway rejects is logged; the others still run.
+pub fn run_command_list(connection: &mut SwayConnection, commands: &[String]) -> Fallible<()> {
+    if commands.is_empty() {
+        return Ok(());
+    }
+    let list = commands.join("; ");
+    info!("Executing command: {list}");
+    for outcome in connection.run_command(&list)? {
+        if let Err(e) = outcome {
+            warn!("sway rejected part of {list:?}: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// [`run_command_list`] on a connection of its own, for callers that may run
+/// alongside a handler's own commands.
+pub fn run_commands(commands: &[String]) -> Fallible<()> {
+    if commands.is_empty() {
+        return Ok(());
+    }
+    run_command_list(&mut SwayConnection::new()?, commands)
+}
+
+/// The sway events the daemon follows.
+pub enum SwayEvent {
+    /// An input device changed; `input` is its GET_INPUTS object.
+    Input {
+        change: String,
+        input: Value,
+    },
+    Tick(TickEvent),
+    /// Outputs were connected, disconnected or changed.
+    Output,
+}
+
+#[derive(Deserialize)]
+struct RawInputEvent {
+    change: String,
+    input: Value,
+}
+
+/// Subscribe to input, tick and output events. The stream is read by hand:
+/// swayipc has no output event, and its typed input events require
+/// vendor/product ids.
+pub fn subscribe_events() -> Fallible<UnixStream> {
+    let mut stream: UnixStream = SwayConnection::new()?.into();
+    let events = serde_json::to_string(&[
+        serde_json::to_value(EventType::Input)?,
+        serde_json::to_value(EventType::Tick)?,
+        Value::from("output"),
+    ])?;
+    stream.write_all(&CommandType::Subscribe.encode_with(&events))?;
+    let reply: Value = CommandType::Subscribe.decode(receive_message(&mut stream)?)?;
+    if reply["success"] != true {
+        return Err(SwayError::SubscriptionFailed(events));
+    }
+    Ok(stream)
+}
+
+/// Decode a message read from a [`subscribe_events`] stream.
+pub fn decode_event((kind, payload): (u32, Vec<u8>)) -> Fallible<SwayEvent> {
+    Ok(match kind {
+        INPUT_EVENT => {
+            let RawInputEvent { change, input } = serde_json::from_slice(&payload)?;
+            SwayEvent::Input { change, input }
+        }
+        TICK_EVENT => SwayEvent::Tick(serde_json::from_slice(&payload)?),
+        OUTPUT_EVENT => SwayEvent::Output,
+        _ => return Err(SwayError::UnimplementedEvent(kind & 0x7fff_ffff, payload)),
+    })
 }
 
 pub fn retry_action<F, T, E>(action: F, max_retry: usize, duration_before_retry: Duration) -> T

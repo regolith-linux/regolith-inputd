@@ -11,25 +11,36 @@ use swayipc::{ClickMethod, Connection as SwayConnection, EnabledOrDisabled, Inpu
 
 use crate::{ALLOW_GSETTINGS_APPLY, ALLOW_SWAYINPUT_APPLY};
 
-/// Pointer types whose acceleration profile the daemon has set.
-static ACCEL_PROFILE_SET: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+/// Pointer types whose acceleration profile the daemon has set. Trackballs,
+/// which are configured one by one rather than by type, are recorded as
+/// [`TRACKBALL_PROFILE`].
+pub(crate) static ACCEL_PROFILE_SET: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// The [`ACCEL_PROFILE_SET`] entry for trackballs.
+pub(crate) const TRACKBALL_PROFILE: &str = "trackball";
+
+/// sway's `accel_profile` for a GNOME `accel-profile` value. "default" means
+/// the device's own default, which sway has no value for: until the daemon
+/// has set a profile there is nothing to undo, so it leaves the devices as
+/// libinput or the user's sway config set them; after that it restores
+/// adaptive, libinput's default profile.
+pub fn sway_accel_profile(gnome_value: &str, already_set: bool) -> Option<&'static str> {
+    match gnome_value {
+        "flat" => Some("flat"),
+        "adaptive" => Some("adaptive"),
+        _ if already_set => Some("adaptive"),
+        _ => None,
+    }
+}
 
 /// The command that applies a GNOME `accel-profile` value to every device of
-/// `pointer_type`. "default" means the device's own default, which sway has
-/// no value for: until the daemon has set a profile there is nothing to
-/// undo, so it leaves the devices as libinput or the user's sway config set
-/// them; after that it restores adaptive, libinput's default profile.
+/// `pointer_type`; see [`sway_accel_profile`].
 pub fn accel_profile_command(
     pointer_type: &str,
     gnome_value: &str,
     already_set: bool,
 ) -> Option<String> {
-    let profile = match gnome_value {
-        "flat" => "flat",
-        "adaptive" => "adaptive",
-        _ if already_set => "adaptive",
-        _ => return None,
-    };
+    let profile = sway_accel_profile(gnome_value, already_set)?;
     Some(format!("input type:{pointer_type} accel_profile {profile}"))
 }
 
@@ -39,6 +50,13 @@ pub trait InputHandler {
     fn apply_changes(&mut self, _: &str) -> Result<(), Box<dyn Error>>;
     fn apply_all(&mut self) -> Result<(), Box<dyn Error>>;
     fn sync_gsettings(&mut self, _: &Input) -> Result<(), Box<dyn Error>>;
+
+    /// Configure a device sway has just reported as added (its GET_INPUTS
+    /// object). Settings sway applies by device type reach new devices on
+    /// their own; handlers that configure devices one by one override this.
+    fn device_added(&mut self, _device: &serde_json::Value) -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
 
     fn apply_changes_sync(&mut self, key: &str) -> Result<(), Box<dyn Error>> {
         unsafe {

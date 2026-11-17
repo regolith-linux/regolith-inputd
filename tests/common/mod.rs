@@ -17,9 +17,11 @@ use std::time::{Duration, Instant};
 const MAGIC: &[u8; 6] = b"i3-ipc";
 const RUN_COMMAND: u32 = 0;
 const SUBSCRIBE: u32 = 2;
+const GET_OUTPUTS: u32 = 3;
 const GET_TREE: u32 = 4;
 const SEND_TICK: u32 = 10;
 const GET_INPUTS: u32 = 100;
+const OUTPUT_EVENT: u32 = 0x8000_0001;
 const WINDOW_EVENT: u32 = 0x8000_0003;
 const TICK_EVENT: u32 = 0x8000_0007;
 const INPUT_EVENT: u32 = 0x8000_0015;
@@ -55,6 +57,7 @@ pub struct FakeSway {
 
 struct State {
     inputs: Value,
+    outputs: Value,
     /// Subscribed clients, with the events they subscribed to.
     subscribers: Vec<(UnixStream, Vec<String>)>,
     /// How many times a client asked for the tree.
@@ -128,12 +131,13 @@ impl State {
 }
 
 impl FakeSway {
-    fn start(socket: &Path, inputs: &'static str) -> FakeSway {
+    fn start(socket: &Path, inputs: &str, outputs: &str) -> FakeSway {
         let listener = UnixListener::bind(socket).unwrap();
         let commands = Arc::new(Mutex::new(Vec::new()));
         let subscribed = Arc::new(Mutex::new(false));
         let state = Arc::new(Mutex::new(State {
             inputs: serde_json::from_str(inputs).unwrap(),
+            outputs: serde_json::from_str(outputs).unwrap(),
             subscribers: Vec::new(),
             tree_requests: 0,
         }));
@@ -161,6 +165,15 @@ impl FakeSway {
         state.emit(TICK_EVENT, "tick", &event);
     }
 
+    /// Change the outputs to `outputs` (GET_OUTPUTS JSON), as plugging,
+    /// unplugging or configuring a monitor does, and send the output event
+    /// sway sends for it.
+    pub fn set_outputs(&self, outputs: &str) {
+        let mut state = self.state.lock().unwrap();
+        state.outputs = serde_json::from_str(outputs).unwrap();
+        state.emit(OUTPUT_EVENT, "output", r#"{"change": "unspecified"}"#);
+    }
+
     /// Switch the keyboards' layout the way the user's key binding does:
     /// in sway itself, not through a command from the daemon.
     pub fn user_switch(&self, index: usize) {
@@ -182,6 +195,41 @@ impl FakeSway {
             .lock()
             .unwrap()
             .emit(WINDOW_EVENT, "window", &event);
+    }
+
+    /// Plug in `device` (its GET_INPUTS object): sway lists it and sends an
+    /// input event with change `added`.
+    pub fn add_input(&self, device: Value) {
+        let mut state = self.state.lock().unwrap();
+        state.inputs.as_array_mut().unwrap().push(device.clone());
+        let event = json!({"change": "added", "input": device}).to_string();
+        state.emit(INPUT_EVENT, "input", &event);
+    }
+
+    /// The commands sway got, each command of a command list on its own.
+    pub fn single_commands(&self) -> Vec<String> {
+        self.commands()
+            .iter()
+            .flat_map(|list| list.split("; ").map(String::from).collect::<Vec<_>>())
+            .collect()
+    }
+
+    /// Wait until sway has got `command`, alone or in a command list, after
+    /// the first `skip` messages. Returns whether it did within 10 s.
+    pub fn wait_for_command(&self, skip: usize, command: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if self
+                .commands()
+                .iter()
+                .skip(skip)
+                .any(|list| list.split("; ").any(|c| c == command))
+            {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        false
     }
 
     /// The first keyboard's layouts and the index of the active one.
@@ -318,6 +366,7 @@ fn serve(
                 "[]".to_string()
             }
             GET_INPUTS => state.inputs.to_string(),
+            GET_OUTPUTS => state.outputs.to_string(),
             _ => "[]".to_string(),
         };
         if stream.write_all(&message(kind, &reply)).is_err() {
@@ -362,10 +411,17 @@ impl Daemon {
     }
 
     /// Like `start`, with sway reporting `inputs` (GET_INPUTS JSON).
-    pub fn start_with_inputs(
+    pub fn start_with_inputs(name: &str, keyfile: &str, inputs: &str) -> (FakeSway, Daemon) {
+        Daemon::start_with_devices(name, keyfile, inputs, "[]")
+    }
+
+    /// Like `start`, with sway reporting `inputs` (GET_INPUTS JSON) and
+    /// `outputs` (GET_OUTPUTS JSON).
+    pub fn start_with_devices(
         name: &str,
         keyfile: &str,
-        inputs: &'static str,
+        inputs: &str,
+        outputs: &str,
     ) -> (FakeSway, Daemon) {
         let dir = std::env::temp_dir().join(format!("inputd-test-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -374,7 +430,7 @@ impl Daemon {
         fs::write(settings_dir.join("keyfile"), keyfile).unwrap();
 
         let socket = dir.join("sway.sock");
-        let sway = FakeSway::start(&socket, inputs);
+        let sway = FakeSway::start(&socket, inputs, outputs);
         let child = Command::new(env!("CARGO_BIN_EXE_regolith-inputd"))
             // Without a Wayland display the daemon starts no input method, so
             // tests run from a desktop session leave its IBus alone.

@@ -6,6 +6,8 @@ mod mouse;
 mod shortcuts;
 pub mod source_switching;
 mod touchpad;
+mod touchscreen;
+mod trackball;
 mod traits;
 mod utils;
 
@@ -24,9 +26,12 @@ use std::sync::{
 };
 use std::thread;
 use std::time::Duration;
-use swayipc::{Connection as SwayConnection, Event, TickEvent};
+use swayipc::{Connection as SwayConnection, Input, TickEvent};
 use touchpad::TouchpadHandler;
+use touchscreen::TouchscreenHandler;
+use trackball::TrackballHandler;
 use traits::InputHandler;
+use utils::SwayEvent;
 
 static mut ALLOW_SWAYINPUT_APPLY: AtomicBool = AtomicBool::new(true);
 static mut ALLOW_GSETTINGS_APPLY: AtomicBool = AtomicBool::new(true);
@@ -38,6 +43,7 @@ type HandlerList = SharedRef<Vec<Box<dyn InputHandler + Send>>>;
 // Structs
 pub struct SettingsManager {
     handlers: HandlerList,
+    touchscreens: Option<Arc<TouchscreenHandler>>,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -63,12 +69,21 @@ impl SettingsManager {
             Box::new(InputSourcesHandler::new()),
             Box::new(CursorHandler::new()),
         ];
+        match TrackballHandler::new() {
+            Some(trackball) => handlers.push(Box::new(trackball)),
+            None => warn!("Trackball schema not found, trackball settings are not mirrored"),
+        }
+        let touchscreens = TouchscreenHandler::new();
+        if touchscreens.is_none() {
+            warn!("Touchscreen schema not found, touchscreens are not mapped");
+        }
         match ShortcutsHandler::new() {
             Some(shortcuts) => handlers.push(Box::new(shortcuts)),
             None => warn!("Media keys schema not found, keyboard shortcuts are not mirrored"),
         }
         SettingsManager {
             handlers: Arc::new(Mutex::new(handlers)),
+            touchscreens,
         }
     }
 
@@ -78,26 +93,80 @@ impl SettingsManager {
             handle.apply_all_sync()?;
             handle.monitor_gsettings_change();
         }
+        drop(handlers_lock);
+        if let Some(touchscreens) = &self.touchscreens {
+            if let Err(e) = touchscreens.apply_all() {
+                error!("Failed to map touchscreens: {e}");
+            }
+        }
 
         let handlers_sref = self.handlers.clone();
-        thread::spawn(move || Self::monitor_swayinput_events(handlers_sref));
+        let touchscreens = self.touchscreens.clone();
+        thread::spawn(move || Self::monitor_swayinput_events(handlers_sref, touchscreens));
         Ok(())
     }
 
-    fn monitor_swayinput_events(mut handlers_sref: HandlerList) {
-        let event_stream = utils::retry_action(
-            utils::get_new_inputevent_stream,
-            5,
-            Duration::from_millis(500),
-        );
-        for event in event_stream {
-            match event {
-                Ok(Event::Input(event))
-                    if unsafe { ALLOW_SWAYINPUT_APPLY.load(Ordering::Relaxed) } =>
-                {
-                    utils::sync_input_gsettings(&mut handlers_sref, &event.input).unwrap();
+    /// Configure a device sway reports as added, in every handler that
+    /// configures devices one by one.
+    fn device_added(
+        handlers_sref: &HandlerList,
+        touchscreens: Option<&TouchscreenHandler>,
+        device: &serde_json::Value,
+    ) {
+        let mut handlers_lock = handlers_sref
+            .lock()
+            .expect("Acquired lock for handers_sref");
+        for handle in handlers_lock.iter_mut() {
+            if let Err(e) = handle.device_added(device) {
+                error!("Failed to configure an added device: {e}");
+            }
+        }
+        drop(handlers_lock);
+        if let Some(Err(e)) = touchscreens.map(|t| t.device_added(device)) {
+            error!("Failed to map an added touchscreen: {e}");
+        }
+    }
+
+    fn monitor_swayinput_events(
+        mut handlers_sref: HandlerList,
+        touchscreens: Option<Arc<TouchscreenHandler>>,
+    ) {
+        let mut event_stream =
+            utils::retry_action(utils::subscribe_events, 5, Duration::from_millis(500));
+        loop {
+            // A message that doesn't decode was still read whole: the stream
+            // stays in step.
+            let event = match utils::receive_message(&mut event_stream) {
+                Ok(message) => utils::decode_event(message),
+                Err(e) => {
+                    warn!("{e}");
+                    break;
                 }
-                Ok(Event::Tick(TickEvent {
+            };
+            match event {
+                Ok(SwayEvent::Input { change, input }) => {
+                    // Hardware that appears gets its per-device settings
+                    // whatever the reload and sync state.
+                    if change == "added" {
+                        Self::device_added(&handlers_sref, touchscreens.as_deref(), &input);
+                    }
+                    if !unsafe { ALLOW_SWAYINPUT_APPLY.load(Ordering::Relaxed) } {
+                        continue;
+                    }
+                    // swayipc's typed `Input` requires vendor/product ids.
+                    let Ok(input) = serde_json::from_value::<Input>(input) else {
+                        continue;
+                    };
+                    if let Err(e) = utils::sync_input_gsettings(&mut handlers_sref, &input) {
+                        debug!("{e}");
+                    }
+                }
+                Ok(SwayEvent::Output) => {
+                    if let Some(Err(e)) = touchscreens.as_ref().map(|t| t.outputs_changed()) {
+                        error!("Failed to remap touchscreens after an output change: {e}");
+                    }
+                }
+                Ok(SwayEvent::Tick(TickEvent {
                     payload,
                     first: false,
                     ..
@@ -132,11 +201,15 @@ impl SettingsManager {
                                     error!("Failed to re-apply configs from gsettings: {e}");
                                 }
                             }
+                            drop(handlers_lock);
+                            if let Some(Err(e)) = touchscreens.as_ref().map(|t| t.reload()) {
+                                error!("Failed to re-map touchscreens: {e}");
+                            }
                         }
                         Err(e) => debug!("Invalid Payload Recieved: {e}"),
                     }
                 }
-                Err(e) => warn!("{e}"),
+                Err(e) => debug!("{e}"),
                 _ => continue,
             }
         }
