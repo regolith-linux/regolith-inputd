@@ -1,30 +1,25 @@
+use crate::sway;
 use crate::InputHandler;
 use gio::{prelude::SettingsExtManual, Settings};
 use log::info;
 use std::error::Error;
-use swayipc::{Connection as SwayConnection, Input};
 
 /// Mirrors GNOME's cursor theme and size to sway's seats.
 pub struct CursorHandler {
     settings: Settings,
-    sway_connection: SwayConnection,
 }
 
 impl CursorHandler {
     pub fn new() -> CursorHandler {
         let settings = Settings::new("org.gnome.desktop.interface");
-        let sway_connection = SwayConnection::new().unwrap();
-        CursorHandler {
-            settings,
-            sway_connection,
-        }
+        CursorHandler { settings }
     }
     fn apply_cursor_theme(&mut self) -> Result<(), Box<dyn Error>> {
         let theme: String = self.settings().get("cursor-theme");
         let size: i32 = self.settings().get("cursor-size");
         let cmd = xcursor_theme_command(&theme, size);
         info!("{cmd}");
-        self.sway_connection().run_command(cmd)?;
+        sway::run_command(cmd)?;
         Ok(())
     }
 }
@@ -51,14 +46,8 @@ impl InputHandler for CursorHandler {
     fn settings(&self) -> &Settings {
         &self.settings
     }
-    fn sway_connection(&mut self) -> &mut SwayConnection {
-        &mut self.sway_connection
-    }
     fn apply_all(&mut self) -> Result<(), Box<dyn Error>> {
         self.apply_cursor_theme()
-    }
-    fn sync_gsettings(&mut self, _: &Input) -> Result<(), Box<dyn Error>> {
-        Ok(())
     }
 }
 

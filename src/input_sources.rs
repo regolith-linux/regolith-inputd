@@ -1,4 +1,5 @@
 use crate::input_method::InputMethod;
+use crate::sway;
 use crate::InputHandler;
 use gio::{prelude::SettingsExtManual, Settings};
 use log::{info, warn};
@@ -7,7 +8,6 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
-use swayipc::Connection as SwayConnection;
 
 /// The layout GNOME applies when no source is usable, and the one IBus
 /// gives an engine whose description has none.
@@ -122,16 +122,13 @@ fn element(xml: &str, tag: &str) -> Option<String> {
 
 pub struct InputSourcesHandler {
     settings: Settings,
-    sway_connection: SwayConnection,
     input_method: InputMethod,
 }
 impl InputSourcesHandler {
     pub fn new() -> InputSourcesHandler {
         let settings = Settings::new("org.gnome.desktop.input-sources");
-        let sway_connection = SwayConnection::new().unwrap();
         InputSourcesHandler {
             settings,
-            sway_connection,
             input_method: InputMethod::start(),
         }
     }
@@ -162,7 +159,7 @@ impl InputSourcesHandler {
         ];
         for cmd in cmds {
             info!("{cmd}");
-            for outcome in self.sway_connection().run_command(&cmd)? {
+            for outcome in sway::run_command(&cmd)? {
                 if let Err(e) = outcome {
                     warn!("{cmd}: {e}");
                 }
@@ -183,7 +180,7 @@ impl InputSourcesHandler {
         }
         let cmd = xkb_options_command(&options);
         info!("{cmd}");
-        self.sway_connection().run_command(cmd)?;
+        sway::run_command(cmd)?;
         Ok(())
     }
 }
@@ -210,13 +207,6 @@ impl InputHandler for InputSourcesHandler {
     }
     fn settings(&self) -> &Settings {
         &self.settings
-    }
-    fn sync_gsettings(&mut self, input: &swayipc::Input) -> Result<(), Box<dyn Error>> {
-        info!("xkb_layout: {}", input.xkb_layout_names[0]);
-        Ok(())
-    }
-    fn sway_connection(&mut self) -> &mut swayipc::Connection {
-        &mut self.sway_connection
     }
 }
 unsafe impl Send for InputSourcesHandler {}

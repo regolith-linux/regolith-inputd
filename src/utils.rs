@@ -1,30 +1,11 @@
-use log::{error, info, warn};
-use std::io::{Read, Write};
+use crate::sway;
+use std::io::Read;
 use std::os::unix::net::UnixStream;
-use std::{error::Error, fmt::Display, thread, time::Duration};
-use swayipc::{
-    CommandType, Connection as SwayConnection, Error as SwayError, EventStream, EventType,
-    Fallible, Input, MAGIC,
-};
+use swayipc::{Error as SwayError, Fallible, Input, MAGIC};
 
-use crate::HandlerList;
-
-pub fn sync_input_gsettings<'a>(
-    handlers_sref: &'a mut HandlerList,
-    input: &Input,
-) -> Result<(), Box<dyn Error + 'a>> {
-    let input_type = input.input_type.clone();
-    let handler_index = match input_type.as_ref() {
-        "pointer" => 0,
-        "keyboard" => 1,
-        "touchpad" => 2,
-        _ => return Err("Incompatible input type".into()),
-    };
-    info!("Recieved Sway InputEvent for {}", input.input_type);
-    let mut handlers_lock = handlers_sref.lock()?;
-    handlers_lock[handler_index].sync_gsettings_sync(input)?;
-    Ok(())
-}
+const WORKSPACE_EVENT: u32 = 0x8000_0000;
+const TICK_EVENT: u32 = 0x8000_0007;
+const INPUT_EVENT: u32 = 0x8000_0015;
 
 /// Read one whole sway IPC message: its type and its payload. The payload is
 /// read in full before it is decoded, so one that doesn't decode never
@@ -47,19 +28,16 @@ pub fn receive_message(stream: &mut UnixStream) -> Fallible<(u32, Vec<u8>)> {
 /// sway's input devices, untyped. swayipc's `Input` requires `vendor` and
 /// `product`, which sway reports for libinput devices only: virtual
 /// keyboards (on-screen keyboards, remote-desktop servers) and the wlroots
-/// X11/Wayland backends' devices have neither.
+/// X11/Wayland backends' devices have neither. They are the current sway's.
 pub fn get_inputs_json() -> Fallible<Vec<serde_json::Value>> {
-    let mut stream: UnixStream = SwayConnection::new()?.into();
-    stream.write_all(&CommandType::GetInputs.encode())?;
-    CommandType::GetInputs.decode(receive_message(&mut stream)?)
+    sway::current().ok_or_else(sway::gone)?.get_inputs_json()
 }
 
 /// sway's outputs, untyped, disabled ones included. swayipc's `Output`
-/// requires fields sway leaves out for some outputs.
+/// requires fields sway leaves out for some outputs. They are the current
+/// sway's.
 pub fn get_outputs_json() -> Fallible<Vec<serde_json::Value>> {
-    let mut stream: UnixStream = SwayConnection::new()?.into();
-    stream.write_all(&CommandType::GetOutputs.encode())?;
-    CommandType::GetOutputs.decode(receive_message(&mut stream)?)
+    sway::current().ok_or_else(sway::gone)?.get_outputs_json()
 }
 
 /// The input devices swayipc's `Input` can describe; the others are left out.
@@ -70,31 +48,37 @@ pub fn get_inputs() -> Fallible<Vec<Input>> {
         .collect())
 }
 
-pub fn get_new_inputevent_stream() -> Fallible<EventStream> {
-    let connection = SwayConnection::new()?;
-    let subs = [EventType::Input, EventType::Tick];
-    connection.subscribe(subs)
+/// An event from sway, as far as the daemon cares.
+pub enum SwayEvent {
+    /// An input device was configured. What the event reports isn't kept:
+    /// by the time it is read it may be out of date.
+    Input,
+    /// An input device was added or removed.
+    Hotplug,
+    /// A tick sent with `swaymsg -t send_tick`, with its payload.
+    Tick(String),
+    /// sway loaded its configuration again.
+    WorkspaceReload,
+    Other,
 }
 
-pub fn retry_action<F, T, E>(action: F, max_retry: usize, duration_before_retry: Duration) -> T
-where
-    F: Fn() -> Result<T, E>,
-    E: Display,
-{
-    let mut retries_left = max_retry;
-    loop {
-        match action() {
-            Ok(res) => break res,
-            Err(e) => {
-                if retries_left == 0 {
-                    error!("{e}");
-                    panic!();
-                }
-                warn!("{e}");
-                retries_left -= 1;
-                thread::sleep(duration_before_retry);
-            }
+/// What an event the daemon subscribed to with its input, tick and workspace
+/// events is to it. The event's payload was read whole, so one that doesn't
+/// decode (devices without vendor or product ids) still gets through.
+pub(crate) fn decode_event(kind: u32, payload: &[u8]) -> SwayEvent {
+    let payload: serde_json::Value = serde_json::from_slice(payload).unwrap_or_default();
+    match kind {
+        INPUT_EVENT if payload["change"] == "added" || payload["change"] == "removed" => {
+            SwayEvent::Hotplug
         }
+        INPUT_EVENT => SwayEvent::Input,
+        // The tick sent to every new subscriber is no reload.
+        TICK_EVENT if payload["first"] == false => match payload["payload"].as_str() {
+            Some(tick) => SwayEvent::Tick(tick.to_string()),
+            None => SwayEvent::Other,
+        },
+        WORKSPACE_EVENT if payload["change"] == "reload" => SwayEvent::WorkspaceReload,
+        _ => SwayEvent::Other,
     }
 }
 

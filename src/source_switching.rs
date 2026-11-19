@@ -6,9 +6,14 @@
 //! Commands this module sends are fenced with a SEND_TICK: layout events seen
 //! before the fence's tick are the daemon's own and are never taken for a
 //! user's switch.
+//!
+//! The owner of the handlers tells it about every sway the daemon reaches,
+//! once the source list is applied there. Each starts afresh, as at a first
+//! launch: nothing the module knew about an earlier sway (its windows, its
+//! keyboards) is kept, and an earlier sway's events are left alone.
 
 use crate::input_sources::effective_sources;
-use crate::utils;
+use crate::sway::{self, Sway};
 use gio::prelude::*;
 use gio::Settings;
 use glib::ToVariant;
@@ -16,14 +21,10 @@ use log::{debug, info, warn};
 use serde::Deserialize;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::io::Write;
-use std::os::unix::net::UnixStream;
 use std::rc::Rc;
-use std::thread;
-use std::time::Duration;
+use std::sync::Arc;
 use swayipc::{
-    CommandType, Connection, Error as SwayError, Event, EventType, Fallible, InputChange, Node,
-    NodeType, Success, WindowChange, WorkspaceChange,
+    Event, EventType, Fallible, InputChange, Node, NodeType, WindowChange, WorkspaceChange,
 };
 
 const FENCE: &str = "regolith-inputd:sources:";
@@ -52,10 +53,25 @@ struct DeviceEvent {
     input: Device,
 }
 
+/// What the owner hears, in order. Events name the sway instance they come
+/// from.
 enum Msg {
-    Sway(Event),
-    Input(DeviceEvent),
+    Sway(u64, Event),
+    Input(u64, DeviceEvent),
     Setting(String),
+    /// A newly reached sway, with the source list applied.
+    Connected(Arc<Sway>),
+}
+
+/// Tells the source switching rules about every sway the daemon reaches.
+pub struct SourceSwitching(glib::Sender<Msg>);
+
+impl SourceSwitching {
+    /// Follow `sway`, whose source list was just applied, as at a first
+    /// launch.
+    pub(crate) fn follow(&self, sway: Arc<Sway>) {
+        let _ = self.0.send(Msg::Connected(sway));
+    }
 }
 
 struct Keyboard {
@@ -65,7 +81,10 @@ struct Keyboard {
 
 struct Switcher {
     settings: Settings,
-    conn: Option<Connection>,
+    /// The sway followed, if any.
+    sway: Option<Arc<Sway>>,
+    /// The owner's queue, which a new sway's events join.
+    queue: glib::Sender<Msg>,
     sources: Vec<Source>,
     /// Listed sources that were chosen or made current, most recent first.
     /// The never-chosen ones are not in it.
@@ -104,12 +123,12 @@ fn has_views(n: &Node) -> bool {
 }
 
 impl Switcher {
-    fn new() -> Switcher {
+    fn new(queue: glib::Sender<Msg>) -> Switcher {
         let settings = Settings::new("org.gnome.desktop.input-sources");
-        let conn = Connection::new().ok();
         Switcher {
             settings,
-            conn,
+            sway: None,
+            queue,
             sources: Vec::new(),
             recent: Vec::new(),
             current: None,
@@ -172,8 +191,46 @@ impl Switcher {
         }
     }
 
+    /// Follow a sway that was just reached, forgetting the earlier one.
+    fn connected(&mut self, sway: Arc<Sway>) {
+        self.sway = None;
+        self.current = None;
+        self.windows.clear();
+        self.focused = None;
+        self.keyboards.clear();
+        self.fence_sent = 0;
+        self.fence_seen = 0;
+        // Subscribe before reading the initial state, so no event is missed.
+        let generation = sway.generation();
+        let queue = self.queue.clone();
+        let followed = sway.follow(&subscription(), move |kind, payload| {
+            match decode(generation, (kind, payload)) {
+                Ok(msg) => queue.send(msg).is_ok(),
+                // A message that doesn't decode was still read whole: skip
+                // it, the stream stays in step.
+                Err(e) => {
+                    debug!("{e}");
+                    true
+                }
+            }
+        });
+        if let Err(e) = followed {
+            // The owner of the handlers looks for sway again.
+            return debug!("Not following input sources: {e}");
+        }
+        self.sway = Some(sway);
+        self.startup();
+    }
+
+    /// Whether events of sway instance `generation` are followed.
+    fn follows(&self, generation: u64) -> bool {
+        self.sway
+            .as_ref()
+            .is_some_and(|sway| sway.generation() == generation)
+    }
+
     fn query_focused(&mut self) -> Option<i64> {
-        let tree = self.conn.as_mut()?.get_tree().ok()?;
+        let tree = self.sway.as_ref()?.get_tree().ok()?;
         let n = find_focused(&tree)?;
         if is_view(n) {
             Some(n.id)
@@ -183,10 +240,16 @@ impl Switcher {
     }
 
     fn refresh_keyboards(&mut self) {
-        let inputs = match utils::get_inputs_json() {
+        let inputs = match self.sway.as_ref().ok_or_else(sway::gone) {
+            Ok(sway) => sway.get_inputs_json(),
+            Err(e) => Err(e),
+        };
+        let inputs = match inputs {
             Ok(i) => i,
             Err(e) => {
-                warn!("{e}");
+                if !sway::is_gone(&e) {
+                    warn!("{e}");
+                }
                 return;
             }
         };
@@ -212,7 +275,7 @@ impl Switcher {
     fn send_fence(&mut self) {
         self.fence_sent += 1;
         let payload = format!("{FENCE}{}", self.fence_sent);
-        if let Some(c) = self.conn.as_mut() {
+        if let Some(c) = self.sway.as_ref() {
             if c.send_tick(&payload).is_err() {
                 // No tick support (or no sway): nothing will clear it.
                 self.fence_seen = self.fence_sent;
@@ -234,9 +297,10 @@ impl Switcher {
         }
         let cmd = format!("input type:keyboard xkb_switch_layout {index}");
         debug!("{cmd}");
-        if let Some(c) = self.conn.as_mut() {
-            if let Err(e) = c.run_command(&cmd) {
-                warn!("{e}");
+        if let Some(c) = self.sway.as_ref() {
+            match c.run_command(&cmd) {
+                Err(e) if !sway::is_gone(&e) => warn!("{e}"),
+                _ => (),
             }
         }
         self.send_fence();
@@ -374,70 +438,34 @@ impl Switcher {
     }
 }
 
-/// Subscribe to the events the switcher follows. The stream is read by hand
-/// rather than through swayipc's `EventStream`, whose typed input events
-/// require vendor/product ids.
-fn subscribe() -> Fallible<UnixStream> {
-    let mut stream: UnixStream = Connection::new()?.into();
-    let events = serde_json::to_string(&[
+/// The events the switcher follows. The stream is read by hand rather than
+/// through swayipc's `EventStream`, whose typed input events require
+/// vendor/product ids.
+fn subscription() -> String {
+    let events = [
         EventType::Window,
         EventType::Workspace,
         EventType::Input,
         EventType::Tick,
-    ])?;
-    stream.write_all(&CommandType::Subscribe.encode_with(&events))?;
-    let reply: Success = CommandType::Subscribe.decode(utils::receive_message(&mut stream)?)?;
-    if !reply.success {
-        return Err(SwayError::SubscriptionFailed(events));
-    }
-    Ok(stream)
+    ];
+    serde_json::to_string(&events).unwrap_or_default()
 }
 
-fn decode((kind, payload): (u32, Vec<u8>)) -> Fallible<Msg> {
+fn decode(generation: u64, (kind, payload): (u32, Vec<u8>)) -> Fallible<Msg> {
     if kind & 0x7fff_ffff == INPUT_EVENT {
-        Ok(Msg::Input(serde_json::from_slice(&payload)?))
+        Ok(Msg::Input(generation, serde_json::from_slice(&payload)?))
     } else {
-        Ok(Msg::Sway(Event::decode((kind, payload))?))
+        Ok(Msg::Sway(generation, Event::decode((kind, payload))?))
     }
 }
 
-/// Start following GNOME's input-source rules. Must run on the thread that
-/// runs the default GLib main loop, after the source list was applied.
-pub fn start() {
-    let sw = Rc::new(RefCell::new(Switcher::new()));
+/// Start following GNOME's input-source rules, on each sway the returned
+/// handle is told about. Must run on the thread that runs the default GLib
+/// main loop.
+pub fn start() -> SourceSwitching {
     let (tx, rx) = glib::MainContext::channel::<Msg>(glib::PRIORITY_DEFAULT);
-
-    // Subscribe before reading the initial state, so no event is missed.
-    let first = subscribe();
-    let sway_tx = tx.clone();
-    thread::spawn(move || {
-        let mut stream = first;
-        loop {
-            match stream.as_mut() {
-                Ok(events) => loop {
-                    match utils::receive_message(events) {
-                        // A message that doesn't decode was still read
-                        // whole: skip it, the stream stays in step.
-                        Ok(message) => match decode(message) {
-                            Ok(msg) => {
-                                if sway_tx.send(msg).is_err() {
-                                    return;
-                                }
-                            }
-                            Err(e) => debug!("{e}"),
-                        },
-                        Err(e) => {
-                            warn!("{e}");
-                            break;
-                        }
-                    }
-                },
-                Err(e) => warn!("{e}"),
-            }
-            thread::sleep(Duration::from_millis(500));
-            stream = subscribe();
-        }
-    });
+    let sw = Rc::new(RefCell::new(Switcher::new(tx.clone())));
+    let switching = SourceSwitching(tx.clone());
 
     // Settings changes join the same queue. The owner's own mru-sources write
     // emits "changed" too; only the keys it follows are queued.
@@ -447,16 +475,19 @@ pub fn start() {
         }
     });
 
-    let owner = sw.clone();
+    let owner = sw;
     rx.attach(None, move |msg| {
         let mut s = owner.borrow_mut();
         match msg {
-            Msg::Sway(ev) => s.on_event(ev),
-            Msg::Input(ev) => s.on_input(ev),
+            Msg::Sway(generation, ev) if s.follows(generation) => s.on_event(ev),
+            Msg::Input(generation, ev) if s.follows(generation) => s.on_input(ev),
+            // An earlier sway's.
+            Msg::Sway(..) | Msg::Input(..) => (),
             Msg::Setting(key) if key == "sources" => s.sources_changed(),
             Msg::Setting(_) => s.per_window_changed(),
+            Msg::Connected(sway) => s.connected(sway),
         }
         glib::Continue(true)
     });
-    sw.borrow_mut().startup();
+    switching
 }

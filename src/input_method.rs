@@ -57,27 +57,25 @@
 //! setting.
 
 use crate::input_sources::{ibus_engines, EffectiveSource};
-use crate::utils;
+use crate::{sway, utils};
 use gio::{
     BusType, Cancellable, DBusCallFlags, DBusConnection, DBusConnectionFlags, DBusSignalFlags,
 };
 use glib::ToVariant;
-use log::{info, warn};
+use log::{debug, info, warn};
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use swayipc::{CommandType, Connection as SwayConnection, Error as SwayError, Fallible};
+use swayipc::Fallible;
 
 /// The XKB engine GNOME selects for xkb sources. Used when no installed XKB
 /// engine matches a layout, and when no source is usable.
@@ -398,6 +396,8 @@ impl Supervisor {
                         self.active_layout = Some(index);
                     }
                 }
+                // Read again once a sway is back.
+                Err(e) if sway::is_gone(&e) => debug!("{e}"),
                 Err(e) => warn!("Cannot read sway's keyboards: {e}"),
             }
         }
@@ -418,10 +418,9 @@ impl Supervisor {
     fn follow_outputs(&mut self) {
         let active = match utils::get_outputs_json() {
             Ok(outputs) => active_outputs(&outputs),
-            Err(e) => {
-                warn!("Cannot read sway's outputs: {e}");
-                return;
-            }
+            // Read again once a sway is back.
+            Err(e) if sway::is_gone(&e) => return debug!("{e}"),
+            Err(e) => return warn!("Cannot read sway's outputs: {e}"),
         };
         if let Some(known) = &self.active_outputs {
             let new: Vec<&str> = active
@@ -982,31 +981,37 @@ fn active_layout(inputs: &[Value], count: usize) -> Option<usize> {
 
 /// Tell the supervisor whenever a keyboard or an output changes: sway sends
 /// an input event for every layout switch and keymap change, and an output
-/// event for every output added, removed or reconfigured.
+/// event for every output added, removed or reconfigured. Each sway the
+/// daemon reaches is followed in turn.
 fn watch_sway(shared: &Shared) {
     loop {
-        if let Err(e) = follow_sway_events(shared) {
-            warn!("sway input and output events: {e}");
+        match follow_sway_events(shared) {
+            // The owner of the handlers logs the loss and looks for sway.
+            Err(e) if sway::is_gone(&e) => debug!("sway input and output events: {e}"),
+            Err(e) => warn!("sway input and output events: {e}"),
+            Ok(()) => (),
         }
         thread::sleep(RESTART_DELAY);
     }
 }
 
 fn follow_sway_events(shared: &Shared) -> Fallible<()> {
-    let mut stream: UnixStream = SwayConnection::new()?.into();
-    stream.write_all(&CommandType::Subscribe.encode_with(r#"["input","output"]"#))?;
-    let (_, reply) = utils::receive_message(&mut stream)?;
-    let reply: Value = serde_json::from_slice(&reply)?;
-    if reply["success"] != true {
-        return Err(SwayError::SubscriptionFailed(String::from("input, output")));
-    }
-    // The keyboards and outputs may have changed before the subscription.
+    let sway = sway::current().ok_or_else(sway::gone)?;
+    let mut stream = sway.subscribe(r#"["input","output"]"#)?;
+    // The keyboards and outputs may have changed before the subscription,
+    // or belong to a sway that replaced the one followed so far.
     shared.update(|state| {
         state.keyboards_changed = true;
         state.outputs_changed = true;
     });
     loop {
-        let (kind, payload) = utils::receive_message(&mut stream)?;
+        let (kind, payload) = match utils::receive_message(&mut stream) {
+            Ok(message) => message,
+            Err(e) => {
+                sway.lose(&e);
+                return Err(e);
+            }
+        };
         if kind == OUTPUT_EVENT {
             shared.update(|state| state.outputs_changed = true);
             continue;

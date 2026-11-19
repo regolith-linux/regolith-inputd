@@ -1,15 +1,17 @@
-use crate::traits::{InputHandler, PointerMethods, PrimitiveToSwayType, SwayTypeToPrimitive};
-use crate::utils;
-use gio::{prelude::SettingsExtManual, traits::SettingsExt, Settings};
+use crate::traits::{
+    forget_accel_profile, set_enabled_if_changed, set_if_changed, InputHandler, PointerMethods,
+    PrimitiveToSwayType, SwayTypeToPrimitive,
+};
+use crate::{sway, utils};
+use gio::{prelude::SettingsExtManual, Settings};
 use log::info;
 
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::error::Error;
-use swayipc::{Connection as SwayConnection, Input};
 
 pub struct TouchpadHandler {
     settings: Settings,
-    sway_connection: SwayConnection,
     /// Click method of each touchpad, by identifier, before the daemon
     /// first set one; what GNOME's "default" restores.
     default_click_methods: BTreeMap<String, &'static str>,
@@ -18,10 +20,8 @@ pub struct TouchpadHandler {
 impl TouchpadHandler {
     pub fn new() -> TouchpadHandler {
         let settings = Settings::new("org.gnome.desktop.peripherals.touchpad");
-        let connection = SwayConnection::new().unwrap();
         TouchpadHandler {
             settings,
-            sway_connection: connection,
             default_click_methods: BTreeMap::new(),
             click_method_set: false,
         }
@@ -48,7 +48,7 @@ impl TouchpadHandler {
             .to_sway_type()
             .to_primitive();
         let cmd = format!("input type:touchpad tap {tap_enabled}");
-        self.sway_connection.run_command(cmd)?;
+        sway::run_command(cmd)?;
         Ok(())
     }
     fn apply_scroll_method(&mut self) -> Result<(), Box<dyn Error>> {
@@ -62,7 +62,7 @@ impl TouchpadHandler {
             "none"
         };
         let cmd = format!("input type:touchpad scroll_method {scroll_method}");
-        self.sway_connection.run_command(cmd)?;
+        sway::run_command(cmd)?;
         Ok(())
     }
     fn use_dwt(&mut self) -> Result<(), Box<dyn Error>> {
@@ -72,7 +72,7 @@ impl TouchpadHandler {
             .to_sway_type()
             .to_primitive();
         let cmd = format!("input type:touchpad dwt {dwt_enabled}");
-        self.sway_connection.run_command(cmd)?;
+        sway::run_command(cmd)?;
         Ok(())
     }
     fn send_events(&mut self) -> Result<(), Box<dyn Error>> {
@@ -81,7 +81,7 @@ impl TouchpadHandler {
         let new_val = new_val.replace('-', "_");
         let cmd = format!("input type:touchpad events {new_val}");
         info!("{cmd}");
-        self.sway_connection.run_command(cmd)?;
+        sway::run_command(cmd)?;
         Ok(())
     }
     fn use_drag(&mut self) -> Result<(), Box<dyn Error>> {
@@ -92,7 +92,7 @@ impl TouchpadHandler {
             .to_primitive();
         let cmd = format!("input type:touchpad drag {use_drag_enabled}");
         info!("{cmd}");
-        self.sway_connection.run_command(cmd)?;
+        sway::run_command(cmd)?;
         Ok(())
     }
     fn use_drag_lock(&mut self) -> Result<(), Box<dyn Error>> {
@@ -103,7 +103,7 @@ impl TouchpadHandler {
             .to_primitive();
         let cmd = format!("input type:touchpad drag_lock {drag_lock_enabled}");
         info!("{cmd}");
-        self.sway_connection.run_command(cmd)?;
+        sway::run_command(cmd)?;
         Ok(())
     }
 
@@ -114,7 +114,7 @@ impl TouchpadHandler {
             .to_sway_type()
             .to_primitive();
         let cmd = format!("input type:touchpad middle_emulation {emulate_middle_enabled}");
-        self.sway_connection.run_command(cmd)?;
+        sway::run_command(cmd)?;
         Ok(())
     }
 }
@@ -140,7 +140,7 @@ impl PointerMethods for TouchpadHandler {
         let pointer_type = self.pointer_type();
         let cmd = format!("input type:{pointer_type} left_handed {left_handed_enabled}");
         info!("{cmd}");
-        self.sway_connection().run_command(cmd)?;
+        sway::run_command(cmd)?;
         Ok(())
     }
 
@@ -155,7 +155,7 @@ impl PointerMethods for TouchpadHandler {
         self.click_method_set |= sway_click_method(&click_method).is_some();
         for cmd in commands {
             info!("{cmd}");
-            self.sway_connection().run_command(cmd)?;
+            sway::run_command(cmd)?;
         }
         Ok(())
     }
@@ -219,8 +219,12 @@ impl InputHandler for TouchpadHandler {
     fn settings(&self) -> &Settings {
         &self.settings
     }
-    fn sway_connection(&mut self) -> &mut swayipc::Connection {
-        &mut self.sway_connection
+    /// A new sway's touchpads have their own click methods, and none the
+    /// daemon set.
+    fn reset(&mut self) {
+        self.default_click_methods.clear();
+        self.click_method_set = false;
+        forget_accel_profile(self.pointer_type());
     }
     fn apply_all(&mut self) -> Result<(), Box<dyn Error>> {
         self.apply_speed()?;
@@ -237,37 +241,54 @@ impl InputHandler for TouchpadHandler {
         self.apply_click_method()?;
         Ok(())
     }
-    fn sync_gsettings(&mut self, input: &Input) -> Result<(), Box<dyn Error>> {
-        self.sync_pointer_gsettings(input)?;
-        if input.libinput.is_none() {
-            return Ok(());
+    fn sway_input_type(&self) -> Option<&str> {
+        Some(self.pointer_type())
+    }
+    fn sync_gsettings(&self, setting: &str, value: &Value) -> Result<(), Box<dyn Error>> {
+        let settings = self.settings();
+        match setting {
+            "send_events" => match value.as_str().and_then(gnome_send_events) {
+                Some(send_events) => {
+                    set_if_changed(settings, "send-events", send_events.to_string())
+                }
+                None => Ok(()),
+            },
+            "tap" => set_enabled_if_changed(settings, "tap-to-click", value),
+            "tap_drag" => set_enabled_if_changed(settings, "tap-and-drag", value),
+            "tap_drag_lock" => set_enabled_if_changed(settings, "tap-and-drag-lock", value),
+            _ => self.sync_pointer_gsettings(setting, value),
         }
-        let libinput = input.libinput.as_ref().unwrap();
-        if let Some(enabled) = libinput.send_events.as_ref() {
-            self.settings()
-                .set_string("send-events", enabled.to_primitive())?;
-        }
-        if let Some(tap) = &libinput.tap {
-            self.settings()
-                .set_boolean("tap-to-click", tap.to_primitive())?;
-        }
-        if let Some(drag) = &libinput.tap_drag {
-            self.settings()
-                .set_boolean("tap-and-drag", drag.to_primitive())?;
-        }
-        if let Some(drag_lock) = &libinput.tap_drag_lock {
-            self.settings()
-                .set_boolean("tap-and-drag-lock", drag_lock.to_primitive())?;
-        }
-        Ok(())
     }
 }
+
+/// GNOME's `send-events` for sway's `send_events`. sway spells it
+/// disabled_on_external_mouse, GNOME disabled-on-external-mouse.
+fn gnome_send_events(sway_value: &str) -> Option<&'static str> {
+    match sway_value {
+        "enabled" => Some("enabled"),
+        "disabled" => Some("disabled"),
+        "disabled_on_external_mouse" => Some("disabled-on-external-mouse"),
+        _ => None,
+    }
+}
+
 unsafe impl Send for TouchpadHandler {}
 unsafe impl Sync for TouchpadHandler {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sway_send_events_map_to_gnome() {
+        assert_eq!(gnome_send_events("enabled"), Some("enabled"));
+        assert_eq!(gnome_send_events("disabled"), Some("disabled"));
+        assert_eq!(
+            gnome_send_events("disabled_on_external_mouse"),
+            Some("disabled-on-external-mouse")
+        );
+        assert_eq!(gnome_send_events("something_new"), None);
+    }
 
     #[test]
     fn gnome_click_methods_map_to_sway() {

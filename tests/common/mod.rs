@@ -6,10 +6,12 @@
 
 use serde_json::{json, Value};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -21,6 +23,7 @@ const GET_OUTPUTS: u32 = 3;
 const GET_TREE: u32 = 4;
 const SEND_TICK: u32 = 10;
 const GET_INPUTS: u32 = 100;
+const WORKSPACE_EVENT: u32 = 0x8000_0000;
 const OUTPUT_EVENT: u32 = 0x8000_0001;
 const WINDOW_EVENT: u32 = 0x8000_0003;
 const TICK_EVENT: u32 = 0x8000_0007;
@@ -47,7 +50,11 @@ const OUTPUTS: &str = r#"[{"name": "eDP-1", "active": true, "power": true}]"#;
 
 /// A minimal sway IPC server that records every command it is asked to run.
 ///
-/// It keeps the keyboards' layouts as sway does: `xkb_layout`,
+/// It keeps the devices' libinput settings as sway does: `input` commands
+/// change them, and each device a command changes is reported to the
+/// subscribed clients in a "libinput_config" input event.
+///
+/// It also keeps the keyboards' layouts as sway does: `xkb_layout`,
 /// `xkb_variant` and `xkb_options` commands compile a new keymap, which
 /// starts on the first layout, and `xkb_switch_layout` switches layouts.
 /// Each change is sent to the subscribed clients as an input event, and
@@ -56,6 +63,9 @@ pub struct FakeSway {
     commands: Arc<Mutex<Vec<String>>>,
     subscribed: Arc<Mutex<bool>>,
     state: Arc<Mutex<State>>,
+    socket: PathBuf,
+    /// Set once the fake sway has exited (see [`FakeSway::stop`]).
+    stopped: Arc<AtomicBool>,
 }
 
 struct State {
@@ -63,10 +73,36 @@ struct State {
     outputs: Value,
     /// Subscribed clients, with the events they subscribed to.
     subscribers: Vec<(UnixStream, Vec<String>)>,
+    /// Every connection a client made, to close when sway exits.
+    connections: Vec<UnixStream>,
+    /// How many connections are open: accepted, and their end not read.
+    open: usize,
+    /// Whether requests go unanswered, as with a sway that hangs.
+    silent: bool,
     /// How many times a client asked for the tree.
     tree_requests: usize,
     /// How many times a client asked for the outputs.
     output_requests: usize,
+}
+
+/// The libinput setting, as GET_INPUTS names it, that a sway `input`
+/// subcommand sets.
+fn libinput_setting(subcommand: &str) -> Option<&'static str> {
+    Some(match subcommand {
+        "pointer_accel" => "accel_speed",
+        "accel_profile" => "accel_profile",
+        "natural_scroll" => "natural_scroll",
+        "left_handed" => "left_handed",
+        "tap" => "tap",
+        "drag" => "tap_drag",
+        "drag_lock" => "tap_drag_lock",
+        "dwt" => "dwt",
+        "middle_emulation" => "middle_emulation",
+        "events" => "send_events",
+        "scroll_method" => "scroll_method",
+        "click_method" => "click_method",
+        _ => return None,
+    })
 }
 
 impl State {
@@ -84,6 +120,50 @@ impl State {
             .unwrap()
             .iter_mut()
             .filter(|i| i["type"] == "keyboard")
+    }
+
+    fn input_event(&mut self, change: &str, input: &Value) {
+        let event = json!({"change": change, "input": input}).to_string();
+        self.emit(INPUT_EVENT, "input", &event);
+    }
+
+    /// Run the libinput part of an `input` command, as sway does: set the
+    /// setting on every matching device that has it, and report the devices
+    /// it changed. Like sway, a device lists only the settings it supports.
+    fn run_libinput(&mut self, cmd: &str) {
+        let Some(rest) = cmd.strip_prefix("input ") else {
+            return;
+        };
+        let Some((target, rest)) = rest.rsplit_once(' ').and_then(|(head, value)| {
+            let (target, subcommand) = head.rsplit_once(' ')?;
+            Some((target, (subcommand, value)))
+        }) else {
+            return;
+        };
+        let (subcommand, value) = rest;
+        let Some(setting) = libinput_setting(subcommand) else {
+            return;
+        };
+        let value = match setting {
+            // sway keeps the speed as a float.
+            "accel_speed" => json!(value.parse::<f32>().unwrap() as f64),
+            _ => json!(value),
+        };
+        let mut changed = Vec::new();
+        for input in self.inputs.as_array_mut().unwrap() {
+            let matches = match target.strip_prefix("type:") {
+                Some(input_type) => input["type"] == input_type,
+                None => input["identifier"] == target.trim_matches('"'),
+            };
+            let libinput = &mut input["libinput"];
+            if matches && libinput.get(setting).is_some() && libinput[setting] != value {
+                libinput[setting] = value.clone();
+                changed.push(input.clone());
+            }
+        }
+        for input in changed {
+            self.input_event("libinput_config", &input);
+        }
     }
 
     /// Put every keyboard with more than `index` layouts on `index`.
@@ -105,6 +185,7 @@ impl State {
 
     /// Run the keyboard part of a sway command.
     fn run(&mut self, cmd: &str) {
+        self.run_libinput(cmd);
         let Some(arg) = cmd.strip_prefix("input type:keyboard ") else {
             return;
         };
@@ -140,25 +221,91 @@ impl FakeSway {
         let listener = UnixListener::bind(socket).unwrap();
         let commands = Arc::new(Mutex::new(Vec::new()));
         let subscribed = Arc::new(Mutex::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
         let state = Arc::new(Mutex::new(State {
             inputs: serde_json::from_str(inputs).unwrap(),
             outputs: serde_json::from_str(OUTPUTS).unwrap(),
             subscribers: Vec::new(),
+            connections: Vec::new(),
+            open: 0,
+            silent: false,
             tree_requests: 0,
             output_requests: 0,
         }));
         let (recorded, flag, shared) = (commands.clone(), subscribed.clone(), state.clone());
+        let exited = stopped.clone();
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
+                if exited.load(Ordering::SeqCst) {
+                    return;
+                }
+                {
+                    let mut state = shared.lock().unwrap();
+                    state.open += 1;
+                    if let Ok(registered) = stream.try_clone() {
+                        state.connections.push(registered);
+                    }
+                }
                 let (recorded, flag, shared) = (recorded.clone(), flag.clone(), shared.clone());
-                thread::spawn(move || serve(stream, recorded, flag, shared));
+                thread::spawn(move || {
+                    serve(stream, recorded, flag, shared.clone());
+                    shared.lock().unwrap().open -= 1;
+                });
             }
         });
         FakeSway {
             commands,
             subscribed,
             state,
+            socket: socket.to_path_buf(),
+            stopped,
         }
+    }
+
+    /// A fresh fake sway listening on `socket`, as a sway started (again) at
+    /// that path.
+    pub fn start_at(socket: &Path) -> FakeSway {
+        FakeSway::start(socket, INPUTS)
+    }
+
+    /// Exit, as sway does: every connection is closed and the socket goes
+    /// away.
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        // Wake the listener up, so that it sees it has to stop.
+        let _ = UnixStream::connect(&self.socket);
+        let _ = fs::remove_file(&self.socket);
+        let mut state = self.state.lock().unwrap();
+        for stream in state.connections.drain(..) {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        state.subscribers.clear();
+    }
+
+    /// Close the connections clients subscribed to events on, and only
+    /// those, as sway does with a subscriber it gives up on.
+    pub fn drop_subscribers(&self) {
+        let mut state = self.state.lock().unwrap();
+        for (stream, _) in state.subscribers.drain(..) {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+
+    /// Stop answering requests, or answer them again, as a sway that hangs
+    /// and recovers. Requests made in the meantime are never answered.
+    pub fn set_silent(&self, silent: bool) {
+        self.state.lock().unwrap().silent = silent;
+    }
+
+    /// How many connections clients have open to this sway: the ones whose
+    /// end has not been read yet.
+    pub fn open_connections(&self) -> usize {
+        self.state.lock().unwrap().open
+    }
+
+    /// How many clients are subscribed to events.
+    pub fn subscribers(&self) -> usize {
+        self.state.lock().unwrap().subscribers.len()
     }
 
     /// Send a tick event to the daemon, as `swaymsg -t send_tick` does. The
@@ -178,6 +325,54 @@ impl FakeSway {
         let mut state = self.state.lock().unwrap();
         state.outputs = serde_json::from_str(outputs).unwrap();
         state.emit(OUTPUT_EVENT, "output", r#"{"change": "unspecified"}"#);
+    }
+
+    /// Send the workspace "reload" event sway sends once it has loaded its
+    /// configuration again.
+    pub fn send_workspace_reload(&self) {
+        let event = json!({"change": "reload", "current": null, "old": null}).to_string();
+        let mut state = self.state.lock().unwrap();
+        state.emit(WORKSPACE_EVENT, "workspace", &event);
+    }
+
+    /// Run an `input` command the way the user does with swaymsg, or the
+    /// way a reload resets a device: in sway, not from the daemon.
+    pub fn user_command(&self, cmd: &str) {
+        self.state.lock().unwrap().run(cmd);
+    }
+
+    /// Send an input event about `input`, as sway does for a device that is
+    /// added or removed (`change` "added", "removed") or was configured
+    /// ("libinput_config"). The devices sway reports don't change.
+    pub fn send_input_event(&self, change: &str, input: Value) {
+        self.state.lock().unwrap().input_event(change, &input);
+    }
+
+    /// Plug in a device, as GET_INPUTS reports it.
+    pub fn add_device(&self, input: Value) {
+        let mut state = self.state.lock().unwrap();
+        state.inputs.as_array_mut().unwrap().push(input.clone());
+        state.input_event("added", &input);
+    }
+
+    /// Unplug the device `identifier`.
+    pub fn remove_device(&self, identifier: &str) {
+        let mut state = self.state.lock().unwrap();
+        let inputs = state.inputs.as_array_mut().unwrap();
+        let index = inputs
+            .iter()
+            .position(|i| i["identifier"] == identifier)
+            .unwrap();
+        let input = inputs.remove(index);
+        state.input_event("removed", &input);
+    }
+
+    /// The libinput `setting` of device `identifier`, as sway reports it.
+    pub fn libinput(&self, identifier: &str, setting: &str) -> Value {
+        let state = self.state.lock().unwrap();
+        let inputs = state.inputs.as_array().unwrap();
+        let input = inputs.iter().find(|i| i["identifier"] == identifier);
+        input.unwrap()["libinput"][setting].clone()
     }
 
     /// Switch the keyboards' layout the way the user's key binding does:
@@ -316,12 +511,17 @@ fn serve(
         let len = u32::from_ne_bytes(header[6..10].try_into().unwrap()) as usize;
         let kind = u32::from_ne_bytes(header[10..14].try_into().unwrap());
         let mut payload = vec![0u8; len];
-        stream.read_exact(&mut payload).unwrap();
+        if stream.read_exact(&mut payload).is_err() {
+            return;
+        }
         let payload = String::from_utf8(payload).unwrap();
         // Replies are written with the state locked, so that a client never
         // gets the events a command caused before the command's reply
         // (which is what a fence relies on).
         let mut state = state.lock().unwrap();
+        if state.silent {
+            continue;
+        }
         let reply = match kind {
             RUN_COMMAND => {
                 recorded.lock().unwrap().push(payload.clone());
@@ -462,6 +662,11 @@ impl Daemon {
         self.child.try_wait().unwrap().is_none()
     }
 
+    /// The daemon's process id.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// Write `keyfile` as the user's GSettings and start the daemon on a
     /// fresh fake sway.
     pub fn start(name: &str, keyfile: &str) -> (FakeSway, Daemon) {
@@ -474,22 +679,35 @@ impl Daemon {
         keyfile: &str,
         inputs: &'static str,
     ) -> (FakeSway, Daemon) {
-        Daemon::spawn(name, keyfile, inputs, None)
+        let (sway, daemon) = Daemon::spawn(name, keyfile, Some(inputs), None);
+        (sway.unwrap(), daemon)
     }
 
     /// Like `start`, in a Wayland session with stand-in IBus programs in
     /// `PATH` and a private bus for them, so that the session's own IBus,
     /// if any, is left alone.
     pub fn start_with_ibus(name: &str, keyfile: &str, ibus: Ibus) -> (FakeSway, Daemon) {
-        Daemon::spawn(name, keyfile, INPUTS, Some(ibus))
+        let (sway, daemon) = Daemon::spawn(name, keyfile, Some(INPUTS), Some(ibus));
+        (sway.unwrap(), daemon)
+    }
+
+    /// Like `start`, with no sway listening yet at the daemon's `SWAYSOCK`
+    /// (see [`Daemon::socket`]).
+    pub fn start_without_sway(name: &str, keyfile: &str) -> Daemon {
+        Daemon::spawn(name, keyfile, None, None).1
+    }
+
+    /// The socket the daemon's `SWAYSOCK` names.
+    pub fn socket(&self) -> PathBuf {
+        self.dir.join("sway.sock")
     }
 
     fn spawn(
         name: &str,
         keyfile: &str,
-        inputs: &'static str,
+        inputs: Option<&'static str>,
         ibus: Option<Ibus>,
-    ) -> (FakeSway, Daemon) {
+    ) -> (Option<FakeSway>, Daemon) {
         let dir = std::env::temp_dir().join(format!("inputd-test-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let settings_dir = dir.join("config/glib-2.0/settings");
@@ -497,7 +715,7 @@ impl Daemon {
         fs::write(settings_dir.join("keyfile"), keyfile).unwrap();
 
         let socket = dir.join("sway.sock");
-        let sway = FakeSway::start(&socket, inputs);
+        let sway = inputs.map(|inputs| FakeSway::start(&socket, inputs));
         let mut command = Command::new(env!("CARGO_BIN_EXE_regolith-inputd"));
         command
             .env("SWAYSOCK", &socket)
@@ -509,9 +727,13 @@ impl Daemon {
         let trawl_calls = Arc::new(Mutex::new(Vec::new()));
         let bus = match ibus {
             // Without a Wayland display the daemon starts no input method, so
-            // tests run from a desktop session leave its IBus alone.
+            // tests run from a desktop session leave its IBus alone. Without
+            // a session bus it can't learn the session's own sway from the
+            // user manager, and leaves that sway alone too.
             None => {
-                command.env_remove("WAYLAND_DISPLAY");
+                command
+                    .env_remove("WAYLAND_DISPLAY")
+                    .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent");
                 None
             }
             Some(ibus) => Some(fake_ibus(&dir, name, ibus, &trawl_calls, &mut command)),
@@ -851,6 +1073,61 @@ fn fake_trawld(address: &str, trawl: Trawl, calls: Arc<Mutex<Vec<String>>>) {
             .unwrap();
     });
     started.recv().expect("the stand-in trawld did not start");
+}
+
+impl Daemon {
+    /// Wait up to five seconds for `key` to read `value`; returns what it
+    /// read last.
+    pub fn wait_for_gsetting(&self, schema: &str, key: &str, value: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let current = self.gsettings_get(schema, key);
+            if current == value || Instant::now() >= deadline {
+                return current;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Record every change to `schema` from now on, whoever makes it.
+    pub fn monitor(&self, schema: &str) -> GSettingsMonitor {
+        let mut child = Command::new("gsettings")
+            .args(["monitor", schema])
+            .env("GSETTINGS_BACKEND", "keyfile")
+            .env("XDG_CONFIG_HOME", self.dir.join("config"))
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let changes = Arc::new(Mutex::new(Vec::new()));
+        let (stdout, recorded) = (child.stdout.take().unwrap(), changes.clone());
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                recorded.lock().unwrap().push(line);
+            }
+        });
+        // gsettings monitor reports nothing until it watches the keyfile.
+        thread::sleep(Duration::from_millis(300));
+        GSettingsMonitor { child, changes }
+    }
+}
+
+/// The changes `gsettings monitor` reported, one line per change.
+pub struct GSettingsMonitor {
+    child: Child,
+    changes: Arc<Mutex<Vec<String>>>,
+}
+
+impl GSettingsMonitor {
+    pub fn changes(&self) -> Vec<String> {
+        self.changes.lock().unwrap().clone()
+    }
+}
+
+impl Drop for GSettingsMonitor {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 /// Whether the installed GSettings schema `schema` has `key`. Keys are added

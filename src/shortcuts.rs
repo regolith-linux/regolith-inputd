@@ -6,6 +6,7 @@
 //! every custom shortcut and for the built-in launcher and system keys that
 //! have a sensible command under sway.
 
+use crate::sway;
 use crate::traits::InputHandler;
 use gio::{prelude::*, Settings, SettingsSchemaSource};
 use glib::SignalHandlerId;
@@ -14,7 +15,6 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use swayipc::Connection as SwayConnection;
 
 const MEDIA_KEYS_SCHEMA: &str = "org.gnome.settings-daemon.plugins.media-keys";
 const CUSTOM_KEYBINDING_SCHEMA: &str =
@@ -250,7 +250,6 @@ impl Drop for CustomEntry {
 }
 
 struct ShortcutsState {
-    sway_connection: SwayConnection,
     /// Watched custom shortcut entries, keyed by settings path.
     custom_entries: BTreeMap<String, CustomEntry>,
     /// Bindings this daemon has installed in sway, with their exec argument.
@@ -260,7 +259,7 @@ struct ShortcutsState {
 impl ShortcutsState {
     fn run_command(&mut self, command: String) -> Result<(), Box<dyn Error>> {
         debug!("Executing command: {command}");
-        for outcome in self.sway_connection.run_command(&command)? {
+        for outcome in sway::run_command(&command)? {
             if let Err(e) = outcome {
                 warn!("sway rejected `{command}`: {e}");
             }
@@ -327,7 +326,6 @@ impl ShortcutsHandler {
             settings: Settings::new(MEDIA_KEYS_SCHEMA),
             builtin_shortcuts,
             state: Mutex::new(ShortcutsState {
-                sway_connection: SwayConnection::new().unwrap(),
                 custom_entries: BTreeMap::new(),
                 installed: BTreeMap::new(),
             }),
@@ -367,8 +365,11 @@ impl ShortcutsHandler {
                     // SAFETY: the handler is boxed for the lifetime of the
                     // daemon, and dropping it drops this entry, which
                     // disconnects the callback.
-                    if let Err(e) = unsafe { &*handler }.refresh(false) {
-                        warn!("Failed to update custom shortcut: {e}");
+                    match unsafe { &*handler }.refresh(false) {
+                        // Applied in full once sway is back.
+                        Err(e) if sway::is_gone(&*e) => debug!("{e}"),
+                        Err(e) => warn!("Failed to update custom shortcut: {e}"),
+                        Ok(()) => (),
                     }
                 }
             });
@@ -429,12 +430,9 @@ impl InputHandler for ShortcutsHandler {
     fn settings(&self) -> &Settings {
         &self.settings
     }
-    fn sway_connection(&mut self) -> &mut SwayConnection {
-        &mut self
-            .state
-            .get_mut()
-            .unwrap_or_else(PoisonError::into_inner)
-            .sway_connection
+    /// The bindings installed in an earlier sway are not in a new one.
+    fn reset(&mut self) {
+        self.lock_state().installed.clear();
     }
     fn apply_changes(&mut self, key: &str) -> Result<(), Box<dyn Error>> {
         if key == CUSTOM_KEYBINDINGS_KEY || self.builtin_shortcuts.iter().any(|b| b.key == key) {
@@ -445,9 +443,6 @@ impl InputHandler for ShortcutsHandler {
     }
     fn apply_all(&mut self) -> Result<(), Box<dyn Error>> {
         self.refresh(true)
-    }
-    fn sync_gsettings(&mut self, _: &swayipc::Input) -> Result<(), Box<dyn Error>> {
-        Ok(())
     }
 }
 

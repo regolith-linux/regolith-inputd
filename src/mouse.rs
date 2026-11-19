@@ -1,21 +1,20 @@
-use crate::traits::{InputHandler, PointerMethods, PrimitiveToSwayType, SwayTypeToPrimitive};
-use gio::{prelude::SettingsExtManual, traits::SettingsExt, Settings};
+use crate::sway;
+use crate::traits::{
+    forget_accel_profile, set_enabled_if_changed, InputHandler, PointerMethods,
+    PrimitiveToSwayType, SwayTypeToPrimitive,
+};
+use gio::{prelude::SettingsExtManual, Settings};
 use log::info;
+use serde_json::Value;
 use std::error::Error;
-use swayipc::{Connection as SwayConnection, Input};
 pub struct MouseHandler {
     settings: Settings,
-    sway_connection: SwayConnection,
 }
 
 impl MouseHandler {
     pub fn new() -> MouseHandler {
         let settings = Settings::new("org.gnome.desktop.peripherals.mouse");
-        let sway_connection = SwayConnection::new().unwrap();
-        MouseHandler {
-            settings,
-            sway_connection,
-        }
+        MouseHandler { settings }
     }
 
     /// Touchpads whose left-handed setting is "mouse" (GNOME's default)
@@ -32,7 +31,7 @@ impl MouseHandler {
             .to_primitive();
         let cmd = format!("input type:touchpad left_handed {new_val}");
         info!("Executing command: {cmd}");
-        self.sway_connection().run_command(cmd)?;
+        sway::run_command(cmd)?;
         Ok(())
     }
 }
@@ -50,7 +49,7 @@ impl PointerMethods for MouseHandler {
         let pointer_type = self.pointer_type();
         let cmd = format!("input type:{pointer_type} left_handed {new_val}");
         info!("Executing command: {cmd}");
-        self.sway_connection().run_command(cmd)?;
+        sway::run_command(cmd)?;
         Ok(())
     }
 
@@ -77,8 +76,8 @@ impl InputHandler for MouseHandler {
     fn settings(&self) -> &Settings {
         &self.settings
     }
-    fn sway_connection(&mut self) -> &mut swayipc::Connection {
-        &mut self.sway_connection
+    fn reset(&mut self) {
+        forget_accel_profile(self.pointer_type());
     }
     fn apply_all(&mut self) -> Result<(), Box<dyn Error>> {
         self.apply_speed()?;
@@ -87,18 +86,14 @@ impl InputHandler for MouseHandler {
         self.apply_natural_scroll()?;
         Ok(())
     }
-    fn sync_gsettings(&mut self, input: &Input) -> Result<(), Box<dyn Error>> {
-        info!("Syncronizing mouse input state of sway with gsettings...");
-        self.sync_pointer_gsettings(input)?;
-        if input.libinput.is_none() {
-            return Ok(());
+    fn sway_input_type(&self) -> Option<&str> {
+        Some(self.pointer_type())
+    }
+    fn sync_gsettings(&self, setting: &str, value: &Value) -> Result<(), Box<dyn Error>> {
+        match setting {
+            "left_handed" => set_enabled_if_changed(self.settings(), "left-handed", value),
+            _ => self.sync_pointer_gsettings(setting, value),
         }
-        let libinput = input.libinput.as_ref().unwrap();
-        if let Some(left_handed) = libinput.left_handed.as_ref() {
-            self.settings()
-                .set_boolean("left-handed", left_handed.to_primitive())?;
-        }
-        Ok(())
     }
 }
 

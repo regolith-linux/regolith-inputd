@@ -1,21 +1,16 @@
+use crate::sway;
 use crate::InputHandler;
 use gio::{prelude::SettingsExtManual, Settings};
 use log::info;
 use std::error::Error;
-use swayipc::Connection as SwayConnection;
 
 pub struct KeyboardHandler {
     settings: Settings,
-    sway_connection: SwayConnection,
 }
 impl KeyboardHandler {
     pub fn new() -> KeyboardHandler {
         let settings = Settings::new("org.gnome.desktop.peripherals.keyboard");
-        let sway_connection = SwayConnection::new().unwrap();
-        KeyboardHandler {
-            settings,
-            sway_connection,
-        }
+        KeyboardHandler { settings }
     }
     fn apply_repeat_rate(&mut self) -> Result<(), Box<dyn Error>> {
         let rate = repeat_rate(
@@ -23,13 +18,13 @@ impl KeyboardHandler {
             self.settings().get("repeat-interval"),
         );
         let cmd = format!("input type:keyboard repeat_rate {rate}");
-        self.sway_connection().run_command(cmd)?;
+        sway::run_command(cmd)?;
         Ok(())
     }
     fn apply_repeat_delay(&mut self) -> Result<(), Box<dyn Error>> {
         let delay: u32 = self.settings().get("delay");
         let cmd = format!("input type:keyboard repeat_delay {delay}");
-        self.sway_connection().run_command(cmd)?;
+        sway::run_command(cmd)?;
         Ok(())
     }
 }
@@ -47,15 +42,9 @@ impl InputHandler for KeyboardHandler {
     fn settings(&self) -> &Settings {
         &self.settings
     }
-    fn sway_connection(&mut self) -> &mut swayipc::Connection {
-        &mut self.sway_connection
-    }
     fn apply_all(&mut self) -> Result<(), Box<dyn Error>> {
         self.apply_repeat_rate()?;
         self.apply_repeat_delay()?;
-        Ok(())
-    }
-    fn sync_gsettings(&mut self, _: &swayipc::Input) -> Result<(), Box<dyn Error>> {
         Ok(())
     }
 }
